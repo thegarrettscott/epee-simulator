@@ -2,33 +2,75 @@ import * as THREE from 'three';
 import { VRButton } from 'three/addons/webxr/VRButton.js';
 
 /* ============================================================
-   Fencing Simulator — WebXR (Quest browser) + desktop test mode
+   Épée Simulator — WebXR (Quest browser) + desktop test mode
    Piste runs along the Z axis. Player starts at z=+2 facing -Z,
    opponent at z=-2 facing +Z. Units are meters.
+
+   Physics model: each blade is a rigid rod pinned at the guard.
+   The hand (controller) is authoritative for the guard position
+   and the *intended* direction; the physical blade direction has
+   angular velocity, a grip-spring toward the intended direction,
+   and leverage-weighted contact impulses against the other blade
+   (contact near the tip deflects a blade far more than contact
+   near the guard — forte beats foible).
    ============================================================ */
 
 const CONFIG = {
   boutScore: 15,
   boutTime: 180,           // seconds
   lockout: 0.25,           // double-touch lockout window (s)
-  touchSpeed: 1.1,         // min tip speed (m/s) for a valid thrust
-  cutSpeed: 2.2,           // min lateral tip speed for a sabre cut
-  clashDist: 0.075,        // blade-to-blade contact distance
   resetPause: 1.6,         // pause after a touch (s)
   piste: { length: 14, width: 1.5 },
+
+  // valid touch = swept tip crosses target AND motion is a thrust:
+  touch: {
+    axialSpeed: 1.0,       // min tip speed along the blade axis (m/s) — proxy for the 750g tip force
+    alignment: 0.55,       // min cos(angle between tip velocity and blade axis) — kills slaps/whips
+    pointFirst: 0.45,      // min cos(blade axis vs surface normal) — a turned point skids off
+  },
+
+  physics: {
+    substeps: 6,
+    contactRadius: 0.028,  // blade-to-blade contact distance (with flex contact patch)
+    pressOvershoot: 2.2,   // separation factor under an active press — the carry ratchet
+    idleOvershoot: 1.2,    // gentle ratchet for incidental contact
+    restitution: 0.2,
+    leverageEps: 0.06,     // even near-guard contact moves a blade slightly
+    maxDeflect: 0.75,      // rad — hand grip limit on blade deflection
+    gripK: 2400, gripD: 95,      // player grip spring (blade weight sim OFF — near 1:1)
+    inertiaK: 350, inertiaD: 12, // player grip spring (blade weight sim ON — lag + whip)
+    shockThreshold: 0.9,         // impact (m/s) that momentarily knocks a grip loose
+    parryYield: 0.3,             // a parrying grip resists contact displacement
+    parryPress: 0,               // lateral follow-offset on the parry aim (0 = pure glide)
+    beatAimShake: 0.15,          // how much a hard beat jolts the attacker's committed aim (m per m/s)
+    oppGuardK: 1100,       // opponent grip by state
+    oppAttackK: 1500,
+    oppParryK: 2100,
+    flexK: 230, flexD: 9,  // blade bow (visual) spring
+  },
+
   opponent: {
     preferredDist: 2.05,   // fencing measure they try to keep
     speed: 1.5,            // footwork speed m/s
-    lungeSpeed: 3.4,
-    lungeReach: 1.05,
     attackChance: 0.55,    // per second, when in distance
-    parryChance: 0.72,     // chance to attempt parry on incoming thrust
-    reaction: 0.07,        // seconds before parry starts
+    parryChance: 0.72,     // chance to attempt a parry on an incoming thrust
+    reaction: 0.12,        // s to react to a fast blade (body reads take +0.1s)
   },
+
+  momentum: {
+    maxAccel: 7,           // m/s² footwork — no instant direction changes
+    lungeAccel: 18,        // m/s² explosive lunge drive
+    lungeSpeed: 2.4,       // m/s body speed at full drive
+    tellTime: 0.16,        // s of readable preparation before the lunge launches
+    driveTime: 0.40,       // s of committed, unabortable drive
+    cadence: 2.6,          // Hz stepping rhythm for advances/retreats
+  },
+
+  bladeInertia: false,     // simulate weapon weight on the player's blade (menu toggle)
 };
 
 const WEAPONS = {
-  epee: { label: 'Épée', target: ['torso', 'head', 'arm', 'leg'], offTarget: [], cuts: false },
+  epee: { label: 'Épée', target: ['torso', 'head', 'arm', 'leg'], offTarget: [] },
 };
 
 const weaponKey = 'epee';
@@ -79,7 +121,6 @@ function buildEnvironment() {
   fill.position.set(-6, 8, -6);
   scene.add(fill);
 
-  // Gym floor
   const floor = new THREE.Mesh(
     new THREE.PlaneGeometry(40, 60),
     new THREE.MeshStandardMaterial({ color: 0x3a3f4a, roughness: 0.9 })
@@ -88,8 +129,7 @@ function buildEnvironment() {
   floor.receiveShadow = true;
   scene.add(floor);
 
-  // Piste (metallic strip)
-  const { length: L, width: W } = CONFIG.piste;
+  const { width: W, length: L } = CONFIG.piste;
   const piste = new THREE.Mesh(
     new THREE.BoxGeometry(W, 0.02, L),
     new THREE.MeshStandardMaterial({ color: 0x8a8f98, roughness: 0.35, metalness: 0.75 })
@@ -98,15 +138,12 @@ function buildEnvironment() {
   piste.receiveShadow = true;
   scene.add(piste);
 
-  // Piste lines: center, en-garde (±2m), warning (±5m), end (±7m)
   const lineMat = new THREE.MeshStandardMaterial({ color: 0xe8eaf0, roughness: 0.5 });
-  const zs = [0, 2, -2, 5, -5, 6.9, -6.9];
-  for (const z of zs) {
+  for (const z of [0, 2, -2, 5, -5, 6.9, -6.9]) {
     const line = new THREE.Mesh(new THREE.BoxGeometry(W, 0.022, 0.05), lineMat);
     line.position.set(0, 0.012, z);
     scene.add(line);
   }
-  // Warning zones (last 2m) tinted
   for (const s of [1, -1]) {
     const warn = new THREE.Mesh(
       new THREE.BoxGeometry(W, 0.021, 2),
@@ -116,7 +153,6 @@ function buildEnvironment() {
     scene.add(warn);
   }
 
-  // Simple gym walls for depth cues
   const wallMat = new THREE.MeshStandardMaterial({ color: 0x1b2029, roughness: 1 });
   const backA = new THREE.Mesh(new THREE.PlaneGeometry(40, 8), wallMat);
   backA.position.set(0, 4, -22); scene.add(backA);
@@ -125,7 +161,6 @@ function buildEnvironment() {
   sideA.rotation.y = Math.PI / 2; sideA.position.set(-14, 4, 0); scene.add(sideA);
   const sideB = sideA.clone(); sideB.rotation.y = -Math.PI / 2; sideB.position.x = 14; scene.add(sideB);
 
-  // Overhead lamps (visual only)
   for (let z = -12; z <= 12; z += 8) {
     const lamp = new THREE.Mesh(
       new THREE.BoxGeometry(3, 0.1, 0.8),
@@ -185,7 +220,203 @@ const board = (() => {
   return { draw, setLights };
 })();
 
-/* ---------------- Sword factory ---------------- */
+/* ---------------- Blade physics ---------------- */
+
+const PH = CONFIG.physics;
+const BLADE_LEN = 0.9;
+const _b1 = new THREE.Vector3(), _b2 = new THREE.Vector3(), _b3 = new THREE.Vector3();
+
+class BladePhys {
+  constructor() {
+    this.len = BLADE_LEN;
+    this.root = new THREE.Vector3();
+    this.prevRoot = new THREE.Vector3();
+    this.rootVel = new THREE.Vector3();
+    this.dir = new THREE.Vector3(0, 0, -1);     // physical blade direction (unit)
+    this.dirVel = new THREE.Vector3();          // tangential velocity of dir (1/s)
+    this.targetDir = new THREE.Vector3(0, 0, -1); // where the hand points the blade
+    this.stiffness = PH.gripK;
+    this.damping = PH.gripD;
+    this.flex = 0; this.flexVel = 0;            // blade bow (visual), rad
+    this.flexAxis = new THREE.Vector3(0, 1, 0); // world axis of the bow rotation
+    this.tipPrev = new THREE.Vector3();
+    this.tipNow = new THREE.Vector3();
+    this.yield = 1;    // contact-displacement multiplier (parry grip < 1)
+    this.shock = 0;    // grip knocked loose by a hard beat (s remaining)
+    this.init = false;
+  }
+
+  reset() {
+    this.init = false;
+    this.dirVel.set(0, 0, 0);
+    this.flex = 0; this.flexVel = 0;
+    this.shock = 0;
+  }
+
+  setTargets(rootWorld, dirWorld, frameDt) {
+    this.prevRoot.copy(this.root);
+    this.root.copy(rootWorld);
+    this.targetDir.copy(dirWorld).normalize();
+    if (!this.init) {
+      this.init = true;
+      this.prevRoot.copy(this.root);
+      this.rootVel.set(0, 0, 0);
+      this.dir.copy(this.targetDir);
+      this.tip(this.tipNow); this.tipPrev.copy(this.tipNow);
+      return;
+    }
+    if (frameDt > 0) this.rootVel.subVectors(this.root, this.prevRoot).divideScalar(frameDt);
+    // teleport guard (VR sword reparenting, phrase resets)
+    if (this.rootVel.lengthSq() > 400) {
+      this.rootVel.set(0, 0, 0);
+      this.dir.copy(this.targetDir);
+      this.dirVel.set(0, 0, 0);
+    }
+  }
+
+  substep(dt) {
+    // grip spring toward the hand's intended direction (tangential error);
+    // a hard beat momentarily loosens the grip so displacement sticks
+    this.shock = Math.max(0, this.shock - dt);
+    const k = this.shock > 0 ? this.stiffness * 0.25 : this.stiffness;
+    _b1.subVectors(this.targetDir, this.dir);
+    _b1.addScaledVector(this.dir, -_b1.dot(this.dir));
+    this.dirVel.addScaledVector(_b1, k * dt);
+    this.dirVel.multiplyScalar(Math.max(0, 1 - this.damping * dt));
+    this.dir.addScaledVector(this.dirVel, dt).normalize();
+    this.dirVel.addScaledVector(this.dir, -this.dirVel.dot(this.dir));
+
+    // the hand can only be twisted so far
+    const cos = this.dir.dot(this.targetDir);
+    if (cos < Math.cos(PH.maxDeflect)) {
+      _b2.copy(this.dir).addScaledVector(this.targetDir, -cos);
+      if (_b2.lengthSq() > 1e-10) {
+        _b2.normalize();
+        this.dir.copy(this.targetDir).multiplyScalar(Math.cos(PH.maxDeflect))
+          .addScaledVector(_b2, Math.sin(PH.maxDeflect)).normalize();
+        this.dirVel.multiplyScalar(0.5);
+      }
+    }
+
+    // blade bow (visual spring)
+    this.flexVel += -this.flex * PH.flexK * dt;
+    this.flexVel *= Math.max(0, 1 - PH.flexD * dt);
+    this.flex += this.flexVel * dt;
+  }
+
+  tip(out) { return out.copy(this.root).addScaledVector(this.dir, this.len); }
+  velAt(s, out) { return out.copy(this.rootVel).addScaledVector(this.dirVel, s * this.len); }
+
+  // rotate the rod about the guard so the point at fraction s displaces by `disp`
+  displaceAt(s, disp) {
+    const scale = 1 / Math.max(s * this.len, 0.08);
+    this.dir.addScaledVector(disp, scale).normalize();
+    this.dirVel.addScaledVector(this.dir, -this.dirVel.dot(this.dir));
+  }
+
+  // change the velocity of the point at fraction s by `dv`
+  impulseAt(s, dv) {
+    const scale = 1 / Math.max(s * this.len, 0.08);
+    this.dirVel.addScaledVector(dv, scale);
+    this.dirVel.addScaledVector(this.dir, -this.dirVel.dot(this.dir));
+  }
+
+  deflection() { return Math.acos(THREE.MathUtils.clamp(this.dir.dot(this.targetDir), -1, 1)); }
+
+  kickFlex(amount, axisWorld) {
+    this.flexVel += amount;
+    this.flexAxis.copy(axisWorld);
+  }
+}
+
+const pBlade = new BladePhys();
+const oBlade = new BladePhys();
+
+// closest points between two segments, with parameters
+const _sp = { s: 0, t: 0, dist: 0, pA: new THREE.Vector3(), pB: new THREE.Vector3() };
+const _d1 = new THREE.Vector3(), _d2 = new THREE.Vector3(), _dr = new THREE.Vector3();
+
+function closestSegSeg(p1, q1, p2, q2, out) {
+  _d1.subVectors(q1, p1); _d2.subVectors(q2, p2); _dr.subVectors(p1, p2);
+  const a = _d1.lengthSq(), e = _d2.lengthSq(), f = _d2.dot(_dr);
+  let s, t;
+  if (a <= 1e-9 && e <= 1e-9) { s = 0; t = 0; }
+  else if (a <= 1e-9) { s = 0; t = THREE.MathUtils.clamp(f / e, 0, 1); }
+  else {
+    const c = _d1.dot(_dr);
+    if (e <= 1e-9) { t = 0; s = THREE.MathUtils.clamp(-c / a, 0, 1); }
+    else {
+      const b = _d1.dot(_d2), denom = a * e - b * b;
+      s = denom > 1e-9 ? THREE.MathUtils.clamp((b * f - c * e) / denom, 0, 1) : 0;
+      t = (b * s + f) / e;
+      if (t < 0) { t = 0; s = THREE.MathUtils.clamp(-c / a, 0, 1); }
+      else if (t > 1) { t = 1; s = THREE.MathUtils.clamp((b - c) / a, 0, 1); }
+    }
+  }
+  out.s = s; out.t = t;
+  out.pA.copy(p1).addScaledVector(_d1, s);
+  out.pB.copy(p2).addScaledVector(_d2, t);
+  out.dist = out.pA.distanceTo(out.pB);
+  return out;
+}
+
+const _cn = new THREE.Vector3(), _cvA = new THREE.Vector3(), _cvB = new THREE.Vector3();
+const _tA = new THREE.Vector3(), _tB = new THREE.Vector3();
+
+// one blade-vs-blade contact solve; returns event info or null
+function bladeContact(A, B) {
+  A.tip(_tA); B.tip(_tB);
+  closestSegSeg(A.root, _tA, B.root, _tB, _sp);
+  if (_sp.dist >= PH.contactRadius) return null;
+
+  if (_sp.dist > 1e-6) _cn.subVectors(_sp.pA, _sp.pB).divideScalar(_sp.dist);
+  else _cn.set(0, 1, 0);
+
+  // leverage: force at the foible turns a blade easily, at the forte barely;
+  // yield < 1 = a braced grip (parry) gives ground reluctantly
+  const wA = (_sp.s * _sp.s + PH.leverageEps) * A.yield;
+  const wB = (_sp.t * _sp.t + PH.leverageEps) * B.yield;
+  const wSum = wA + wB;
+
+  // positional separation — resolves past the surface (overshoot) so a
+  // sustained press ratchets the weaker-held blade instead of stalling
+  const os = (A.yield < 1 || B.yield < 1) ? PH.pressOvershoot : PH.idleOvershoot;
+  const pen = PH.contactRadius * os - _sp.dist;
+  A.displaceAt(_sp.s, _b3.copy(_cn).multiplyScalar(pen * wA / wSum));
+  B.displaceAt(_sp.t, _b3.copy(_cn).multiplyScalar(-pen * wB / wSum));
+
+  // impulse if approaching
+  A.velAt(_sp.s, _cvA); B.velAt(_sp.t, _cvB);
+  _cvA.sub(_cvB); // relative velocity at contact
+  const vn = _cvA.dot(_cn);
+  let impact = 0;
+  if (vn < 0) {
+    impact = -vn;
+    const dv = (1 + PH.restitution) * impact;
+    A.impulseAt(_sp.s, _b3.copy(_cn).multiplyScalar(dv * wA / wSum));
+    B.impulseAt(_sp.t, _b3.copy(_cn).multiplyScalar(-dv * wB / wSum));
+  }
+  // a solid beat knocks both grips for a moment — displacement sticks
+  if (impact > PH.shockThreshold) {
+    const dur = Math.min(0.2, 0.05 + impact * 0.03);
+    A.shock = Math.max(A.shock, dur);
+    B.shock = Math.max(B.shock, dur);
+  }
+  // sustained opposition from a braced parry overwhelms the wrist
+  if (B.yield < 1) A.shock = Math.max(A.shock, 0.06);
+  if (A.yield < 1) B.shock = Math.max(B.shock, 0.06);
+  const slide = Math.sqrt(Math.max(0, _cvA.lengthSq() - vn * vn));
+  return { impact, slide, sA: _sp.s, sB: _sp.t, nx: _cn.x, ny: _cn.y, nz: _cn.z };
+}
+
+/* ---------------- Sword visuals (segmented, bendable blade) ---------------- */
+
+const SEGN = 6;
+const SEG_W = (() => { // tip-weighted bend distribution
+  const w = []; let sum = 0;
+  for (let i = 0; i < SEGN; i++) { w.push(i + 1); sum += i + 1; }
+  return w.map(v => v / sum);
+})();
 
 function makeSword(color = 0xd8dde6) {
   const g = new THREE.Group();
@@ -194,7 +425,7 @@ function makeSword(color = 0xd8dde6) {
     new THREE.SphereGeometry(0.065, 24, 16, 0, Math.PI * 2, 0, Math.PI / 2),
     new THREE.MeshStandardMaterial({ color, metalness: 0.85, roughness: 0.3 })
   );
-  guard.rotation.x = -Math.PI / 2; // bowl opens toward the hand
+  guard.rotation.x = -Math.PI / 2;
   g.add(guard);
 
   const grip = new THREE.Mesh(
@@ -205,32 +436,63 @@ function makeSword(color = 0xd8dde6) {
   grip.position.z = 0.08;
   g.add(grip);
 
-  const blade = new THREE.Mesh(
-    new THREE.CylinderGeometry(0.004, 0.009, 0.9, 8),
-    new THREE.MeshStandardMaterial({ color: 0xc9cfd9, metalness: 0.95, roughness: 0.25 })
-  );
-  blade.rotation.x = Math.PI / 2;
-  blade.position.z = -0.45;
-  blade.castShadow = true;
-  g.add(blade);
-
+  // blade: chain of joints so it can bend under contact and bow on touches
+  const segLen = BLADE_LEN / SEGN;
+  const bladeMat = new THREE.MeshStandardMaterial({ color: 0xc9cfd9, metalness: 0.95, roughness: 0.25 });
+  const joints = [];
+  let parent = g;
+  for (let i = 0; i < SEGN; i++) {
+    const joint = new THREE.Group();
+    joint.position.z = i === 0 ? 0 : -segLen;
+    parent.add(joint);
+    const rBase = THREE.MathUtils.lerp(0.009, 0.0035, i / SEGN);
+    const rTip = THREE.MathUtils.lerp(0.009, 0.0035, (i + 1) / SEGN);
+    const seg = new THREE.Mesh(new THREE.CylinderGeometry(rTip, rBase, segLen, 8), bladeMat);
+    seg.rotation.x = -Math.PI / 2; // cylinder +Y → -Z (tipward taper)
+    seg.position.z = -segLen / 2;
+    seg.castShadow = true;
+    joint.add(seg);
+    joints.push(joint);
+    parent = joint;
+  }
   const tip = new THREE.Mesh(
     new THREE.SphereGeometry(0.012, 10, 8),
     new THREE.MeshStandardMaterial({ color: 0xff4444, emissive: 0x661111 })
   );
-  tip.position.z = -0.9;
-  g.add(tip);
+  tip.position.z = -segLen;
+  joints[SEGN - 1].add(tip);
 
-  // Local reference points for hit math (blade points down -Z)
-  g.userData.basePoint = new THREE.Vector3(0, 0, 0);
-  g.userData.tipPoint = new THREE.Vector3(0, 0, -0.9);
-  g.userData.tipMesh = tip;
+  g.userData.joints = joints;
   return g;
 }
 
-function bladeSegment(sword, outBase, outTip) {
-  outBase.copy(sword.userData.basePoint).applyMatrix4(sword.matrixWorld);
-  outTip.copy(sword.userData.tipPoint).applyMatrix4(sword.matrixWorld);
+const _q = new THREE.Quaternion(), _qi = new THREE.Quaternion(), _qj = new THREE.Quaternion();
+const _axW = new THREE.Vector3(), _axL = new THREE.Vector3(), _flexL = new THREE.Vector3();
+const _ldir = new THREE.Vector3(), _base = new THREE.Vector3(0, 0, -1);
+
+// pose the segmented blade along the physical rod + bow flex
+function updateBladeVisual(sword, blade) {
+  sword.getWorldQuaternion(_q);
+  _qi.copy(_q).invert();
+  _ldir.copy(blade.dir).applyQuaternion(_qi); // physical dir in sword-local space
+
+  _axW.crossVectors(_base, _ldir);
+  const sin = _axW.length();
+  const angle = Math.atan2(sin, THREE.MathUtils.clamp(_base.dot(_ldir), -1, 1));
+  if (sin > 1e-6) _axL.copy(_axW).divideScalar(sin); else _axL.set(1, 0, 0);
+
+  _flexL.copy(blade.flexAxis).applyQuaternion(_qi);
+  if (_flexL.lengthSq() < 1e-8) _flexL.set(1, 0, 0); else _flexL.normalize();
+  const bow = THREE.MathUtils.clamp(blade.flex, -0.55, 0.55);
+
+  const joints = sword.userData.joints;
+  for (let i = 0; i < SEGN; i++) {
+    joints[i].quaternion.setFromAxisAngle(_axL, angle * SEG_W[i]);
+    if (Math.abs(bow) > 0.002) {
+      _qj.setFromAxisAngle(_flexL, bow * SEG_W[i]);
+      joints[i].quaternion.multiply(_qj);
+    }
+  }
 }
 
 /* ---------------- Opponent fencer ---------------- */
@@ -245,7 +507,6 @@ function buildOpponent() {
 
   const parts = []; // { node, zone, radius }
 
-  // Torso — slightly crouched en-garde, profile toward the player
   const torso = new THREE.Mesh(new THREE.CapsuleGeometry(0.17, 0.42, 6, 14), jacket);
   torso.position.set(0, 1.12, 0);
   torso.rotation.x = 0.14;
@@ -253,22 +514,20 @@ function buildOpponent() {
   o.add(torso);
   parts.push({ node: torso, zone: 'torso', radius: 0.21 });
 
-  // Head + mask
   const head = new THREE.Mesh(new THREE.SphereGeometry(0.115, 20, 16), dark);
   head.position.set(0, 1.58, 0.04);
   head.castShadow = true;
   o.add(head);
-  const mesh = new THREE.Mesh(
+  const mask = new THREE.Mesh(
     new THREE.SphereGeometry(0.12, 20, 16, 0, Math.PI * 2, 0, Math.PI * 0.55),
     new THREE.MeshStandardMaterial({ color: 0x111318, roughness: 0.4, metalness: 0.6, transparent: true, opacity: 0.85 })
   );
-  mesh.rotation.x = Math.PI / 2.6;
-  head.add(mesh);
+  mask.rotation.x = Math.PI / 2.6;
+  head.add(mask);
   const bib = new THREE.Mesh(new THREE.CylinderGeometry(0.09, 0.13, 0.12, 12), jacket);
   bib.position.y = -0.12; head.add(bib);
   parts.push({ node: head, zone: 'head', radius: 0.15 });
 
-  // Legs — fencing stance (front leg toward player = +Z)
   const frontThigh = new THREE.Mesh(new THREE.CapsuleGeometry(0.07, 0.34, 4, 10), breeches);
   frontThigh.position.set(0.02, 0.72, 0.16); frontThigh.rotation.x = 0.55;
   o.add(frontThigh);
@@ -286,14 +545,12 @@ function buildOpponent() {
     parts.push({ node: leg, zone: 'leg', radius: 0.11 });
   }
 
-  // Back arm, tucked behind
   const backArm = new THREE.Mesh(new THREE.CapsuleGeometry(0.05, 0.3, 4, 10), jacket);
   backArm.position.set(-0.14, 1.28, -0.14); backArm.rotation.z = 0.9; backArm.rotation.x = -0.8;
   backArm.castShadow = true;
   o.add(backArm);
   parts.push({ node: backArm, zone: 'arm', radius: 0.1 });
 
-  // Weapon arm: shoulder pivot -> forearm -> sword. Extension animates rotation+reach.
   const armPivot = new THREE.Group();
   armPivot.position.set(0.16, 1.38, 0.1);
   o.add(armPivot);
@@ -327,7 +584,6 @@ const opp = buildOpponent();
 /* ---------------- Player sword ---------------- */
 
 const playerSword = makeSword();
-playerSword.castShadow = true;
 
 // Desktop: sword hangs off a hand anchor inside the rig; mouse steers it.
 const handAnchor = new THREE.Group();
@@ -335,13 +591,12 @@ handAnchor.position.set(0.22, 1.25, -0.35);
 rig.add(handAnchor);
 handAnchor.add(playerSword);
 
-// Player body target (for opponent's attacks): capsule at rig location
+// Player body target (for the opponent's attacks)
 const playerTarget = {
   radius: 0.2,
   center: new THREE.Vector3(),
   update() {
     this.center.set(rig.position.x, 1.15, rig.position.z);
-    // In VR, follow the actual head position
     if (renderer.xr.isPresenting) {
       const head = new THREE.Vector3();
       camera.getWorldPosition(head);
@@ -368,19 +623,32 @@ const audio = (() => {
     o.connect(g).connect(c.destination);
     o.start(); o.stop(c.currentTime + dur);
   }
-  function clash() {
+  // intensity 0..1; s = contact position on the struck blade (0 guard → 1 tip: tip rings higher)
+  function clash(intensity = 0.5, s = 0.5) {
     const c = ensure();
     const len = 0.09, buf = c.createBuffer(1, c.sampleRate * len, c.sampleRate);
     const d = buf.getChannelData(0);
     for (let i = 0; i < d.length; i++) d[i] = (Math.random() * 2 - 1) * Math.exp(-i / (d.length * 0.25));
     const src = c.createBufferSource(); src.buffer = buf;
-    const f = c.createBiquadFilter(); f.type = 'highpass'; f.frequency.value = 2400;
-    const g = c.createGain(); g.gain.value = 0.5;
+    const f = c.createBiquadFilter(); f.type = 'highpass'; f.frequency.value = 1800 + s * 1600;
+    const g = c.createGain(); g.gain.value = 0.15 + 0.45 * intensity;
     src.connect(f).connect(g).connect(c.destination);
     src.start();
-    buzzer(3400 + Math.random() * 800, 0.06, 'triangle', 0.08);
+    buzzer(1800 + s * 2200, 0.05 + intensity * 0.03, 'triangle', 0.04 + intensity * 0.07);
   }
-  return { buzzer, clash, ensure };
+  // blades sliding along each other
+  function scrape(intensity = 0.5) {
+    const c = ensure();
+    const len = 0.05, buf = c.createBuffer(1, c.sampleRate * len, c.sampleRate);
+    const d = buf.getChannelData(0);
+    for (let i = 0; i < d.length; i++) d[i] = (Math.random() * 2 - 1) * Math.exp(-i / (d.length * 0.5));
+    const src = c.createBufferSource(); src.buffer = buf;
+    const f = c.createBiquadFilter(); f.type = 'bandpass'; f.frequency.value = 2600 + Math.random() * 900; f.Q.value = 2;
+    const g = c.createGain(); g.gain.value = Math.min(0.2, 0.05 + 0.12 * intensity);
+    src.connect(f).connect(g).connect(c.destination);
+    src.start();
+  }
+  return { buzzer, clash, scrape, ensure };
 })();
 
 /* ---------------- Geometry helpers ---------------- */
@@ -398,42 +666,16 @@ function pointSegmentDistance(p, a, b) {
   return p.distanceTo(_ps3);
 }
 
-function segmentSegmentDistance(p1, q1, p2, q2) {
-  // Standard closest-distance between two segments
-  const d1 = new THREE.Vector3().subVectors(q1, p1);
-  const d2 = new THREE.Vector3().subVectors(q2, p2);
-  const r = new THREE.Vector3().subVectors(p1, p2);
-  const a = d1.lengthSq(), e = d2.lengthSq(), f = d2.dot(r);
-  let s, t;
-  if (a <= 1e-9 && e <= 1e-9) return p1.distanceTo(p2);
-  if (a <= 1e-9) { s = 0; t = THREE.MathUtils.clamp(f / e, 0, 1); }
-  else {
-    const c = d1.dot(r);
-    if (e <= 1e-9) { t = 0; s = THREE.MathUtils.clamp(-c / a, 0, 1); }
-    else {
-      const b = d1.dot(d2), denom = a * e - b * b;
-      s = denom > 1e-9 ? THREE.MathUtils.clamp((b * f - c * e) / denom, 0, 1) : 0;
-      t = (b * s + f) / e;
-      if (t < 0) { t = 0; s = THREE.MathUtils.clamp(-c / a, 0, 1); }
-      else if (t > 1) { t = 1; s = THREE.MathUtils.clamp((b - c) / a, 0, 1); }
-    }
-  }
-  const c1 = new THREE.Vector3().copy(p1).addScaledVector(d1, s);
-  const c2 = new THREE.Vector3().copy(p2).addScaledVector(d2, t);
-  return c1.distanceTo(c2);
-}
-
 /* ---------------- Match state ---------------- */
 
 const match = {
   started: false,
-  paused: true,
   scorePlayer: 0,
   scoreOpp: 0,
   time: CONFIG.boutTime,
-  phase: 'ready',          // ready | fencing | halt | over
-  priority: null,          // 'player' | 'opponent' | null — simplified right of way
-  lock: null,              // { first, timer, touches: {player, opponent, playerOff, oppOff} }
+  phase: 'ready',          // ready | fencing | lockout | halt | over
+  priority: null,
+  lock: null,
   haltTimer: 0,
   boardMsg: '',
 };
@@ -483,104 +725,151 @@ function updateHud() {
 /* ---------------- Opponent AI ---------------- */
 
 const ai = {
-  state: 'engarde',        // engarde | advance | retreat | lunge | recover | parry | riposte
+  state: 'engarde',        // engarde | advance | retreat | lunge | riposte | recover | parry
   stateTime: 0,
-  ext: 0.15,               // arm extension 0..1
+  vel: 0,                  // body velocity along z — momentum, not teleports
+  ext: 0.15,
   extTarget: 0.15,
-  lungeZ: 0,               // forward offset during lunge
-  parryDir: 0,             // lateral parry angle
+  parryDir: 0,
   parryTimer: 0,
   reactTimer: 0,
   bob: Math.random() * 10,
+  prevDist: 2.05,
   attacking: false,
+  parryMsg: false,         // 'Parried!' shown for this parry
+  beatMsg: false,          // 'Deflected!' shown for this attack
+  aimFrozen: false,        // committed drives can't re-aim
+  frozenAim: new THREE.Vector3(),
 };
 
 function aiSetState(s) {
   ai.state = s;
   ai.stateTime = 0;
+  if (s === 'parry') ai.parryMsg = false;
+  if (s === 'lunge' || s === 'riposte') ai.beatMsg = false;
 }
 
-function updateOpponent(dt, playerTip, playerTipSpeed, playerApproaching) {
+function updateOpponent(dt) {
   const o = opp.group;
   ai.stateTime += dt;
   ai.bob += dt;
 
   playerTarget.update();
+  const C = CONFIG.opponent, M = CONFIG.momentum;
+  const sign = Math.sign(playerTarget.center.z - o.position.z) || 1;
   const dist = Math.abs(o.position.z - playerTarget.center.z);
-  const C = CONFIG.opponent;
 
-  // --- state machine ---
+  // stepping rhythm — humans move in pulses, not glides
+  const cadence = 0.55 + 0.45 * Math.sin(ai.bob * Math.PI * 2 * M.cadence);
+
+  let desired = 0;
+  let accel = M.maxAccel;
+  let inTell = false;
+
   switch (ai.state) {
     case 'engarde': {
       ai.extTarget = 0.15;
       ai.attacking = false;
       if (dist > C.preferredDist + 0.25) aiSetState('advance');
       else if (dist < C.preferredDist - 0.35) aiSetState('retreat');
-      else if (dist < C.preferredDist + 0.35 && Math.random() < C.attackChance * dt) {
-        aiSetState('lunge');
-        ai.attacking = true;
-        if (!match.priority) match.priority = 'opponent';
-      }
+      else if (match.phase === 'fencing' && Math.random() < C.attackChance * dt) aiSetState('lunge');
       break;
     }
     case 'advance': {
-      o.position.z += C.speed * dt * Math.sign(playerTarget.center.z - o.position.z);
+      ai.extTarget = 0.15;
+      desired = C.speed * cadence * sign;
       if (dist <= C.preferredDist) aiSetState('engarde');
       break;
     }
     case 'retreat': {
-      o.position.z -= C.speed * 1.2 * dt * Math.sign(playerTarget.center.z - o.position.z);
+      desired = -C.speed * 1.15 * cadence * sign;
       if (dist >= C.preferredDist || o.position.z < -6.5) aiSetState('engarde');
       break;
     }
     case 'lunge': {
-      ai.extTarget = 1;
-      if (ai.stateTime > 0.1) ai.lungeZ += C.lungeSpeed * dt;
-      ai.lungeZ = Math.min(ai.lungeZ, C.lungeReach);
-      if (ai.stateTime > 0.55) aiSetState('recover');
-      break;
-    }
-    case 'recover': {
-      ai.extTarget = 0.15;
-      ai.attacking = false;
-      ai.lungeZ = Math.max(0, ai.lungeZ - 2.5 * dt);
-      if (ai.lungeZ === 0 && ai.stateTime > 0.4) {
-        aiSetState(dist < C.preferredDist - 0.2 ? 'retreat' : 'engarde');
-      }
-      break;
-    }
-    case 'parry': {
-      ai.extTarget = 0.55;
-      ai.parryTimer -= dt;
-      if (ai.parryTimer <= 0) {
-        // riposte!
-        aiSetState('riposte');
-        ai.attacking = true;
-        match.priority = 'opponent';
+      if (ai.stateTime < M.tellTime) {
+        // preparation — readable if you watch for it
+        inTell = true;
+        ai.extTarget = 0.55;
+      } else if (ai.stateTime < M.tellTime + M.driveTime) {
+        // committed, ballistic drive — cannot abort
+        ai.extTarget = 1;
+        desired = M.lungeSpeed * sign;
+        accel = M.lungeAccel;
+        if (!ai.attacking) {
+          ai.attacking = true;
+          if (!match.priority) match.priority = 'opponent';
+        }
+      } else {
+        aiSetState('recover');
       }
       break;
     }
     case 'riposte': {
-      ai.extTarget = 1;
-      if (ai.stateTime > 0.1) ai.lungeZ = Math.min(ai.lungeZ + C.lungeSpeed * 1.1 * dt, C.lungeReach * 0.9);
-      if (ai.stateTime > 0.45) aiSetState('recover');
+      if (ai.stateTime < 0.06) {
+        ai.extTarget = 0.8;
+      } else if (ai.stateTime < 0.36) {
+        ai.extTarget = 1;
+        desired = M.lungeSpeed * 0.9 * sign;
+        accel = M.lungeAccel;
+        if (!ai.attacking) {
+          ai.attacking = true;
+          match.priority = 'opponent';
+        }
+      } else {
+        aiSetState('recover');
+      }
+      break;
+    }
+    case 'recover': {
+      ai.attacking = false;
+      ai.extTarget = 0.2;
+      desired = dist < C.preferredDist - 0.15 ? -C.speed * 1.2 * sign : 0;
+      if (ai.stateTime > 0.45 && Math.abs(ai.vel) < 0.25) {
+        aiSetState(dist < C.preferredDist - 0.3 ? 'retreat' : 'engarde');
+      }
+      break;
+    }
+    case 'parry': {
+      ai.extTarget = 0.6;
+      ai.parryTimer -= dt;
+      if (ai.parryTimer <= 0) aiSetState('riposte');
       break;
     }
   }
 
-  // --- parry reaction: player blade incoming toward their target ---
-  if ((ai.state === 'engarde' || ai.state === 'advance' || ai.state === 'retreat') && match.phase === 'fencing') {
-    const tipToTorso = playerTip.distanceTo(_t1.setFromMatrixPosition(opp.torso.matrixWorld));
-    if (tipToTorso < 1.15 && playerApproaching && playerTipSpeed > 1.8) {
+  // --- momentum: acceleration-limited body velocity ---
+  const dv = THREE.MathUtils.clamp(desired - ai.vel, -accel * dt, accel * dt);
+  ai.vel += dv;
+  o.position.z += ai.vel * dt;
+  if (o.position.z < -6.8 || o.position.z > 6.8) {
+    o.position.z = THREE.MathUtils.clamp(o.position.z, -6.8, 6.8);
+    ai.vel = 0;
+  }
+
+  // --- parry reaction (blocked while committed to a drive) ---
+  // they react to a fast blade OR to the body suddenly closing distance —
+  // a slow creep doesn't read as an attack, a rushed advance draws the parry
+  const closing = dt > 0 ? (ai.prevDist - dist) / dt : 0;
+  ai.prevDist = dist;
+  const committed = (ai.state === 'lunge' && ai.stateTime >= M.tellTime) ||
+                    ai.state === 'riposte' || ai.state === 'parry' || ai.state === 'recover';
+  if (!committed && match.phase === 'fencing') {
+    const tipToTorso = pBlade.tipNow.distanceTo(_t1.setFromMatrixPosition(opp.torso.matrixWorld));
+    const approaching = pTipVel.z < -0.3;
+    const bladeThreat = tipToTorso < 1.15 && approaching && pTipVel.length() > 1.8;
+    const bodyThreat = closing > 0.7 && dist < 2.35 && tipToTorso < 1.6;
+    // blade threats are recognized fast; reading footwork takes longer —
+    // so a surprise attack in tempo beats the parry, a prepared one gets read
+    const needed = bladeThreat ? C.reaction : C.reaction + 0.1;
+    if (bladeThreat || bodyThreat) {
       ai.reactTimer += dt;
-      if (ai.reactTimer > C.reaction) {
+      if (ai.reactTimer > needed) {
         if (Math.random() < C.parryChance) {
           aiSetState('parry');
           ai.parryTimer = 0.32 + Math.random() * 0.15;
           ai.reactTimer = 0;
-          ai.parryFeedback = false;
-          // parry to the side the blade is on (quarte/sixte)
-          ai.parryDir = playerTip.x > o.position.x ? 1 : -1;
+          ai.parryDir = pBlade.tipNow.x > o.position.x ? 1 : -1;
         } else {
           ai.reactTimer = -0.35; // failed the read — beaten this exchange
         }
@@ -588,111 +877,180 @@ function updateOpponent(dt, playerTip, playerTipSpeed, playerApproaching) {
     } else if (ai.reactTimer > 0) {
       ai.reactTimer = 0;
     } else if (ai.reactTimer < 0) {
-      ai.reactTimer = Math.min(0, ai.reactTimer + dt); // cooldown recovers between exchanges
+      ai.reactTimer = Math.min(0, ai.reactTimer + dt);
     }
   }
 
   // --- pose / animation ---
   ai.ext = THREE.MathUtils.damp(ai.ext, ai.extTarget, 12, dt);
 
-  // en-garde bob
   const bobY = Math.sin(ai.bob * 2.1) * 0.015 + Math.sin(ai.bob * 5.3) * 0.006;
-  o.position.y = bobY - (ai.lungeZ > 0.05 ? 0.08 : 0);
+  const dip = inTell ? 0.03 * (ai.stateTime / M.tellTime) : (ai.attacking ? 0.06 : 0);
+  o.position.y = bobY - dip;
 
-  // face the player
-  const faceDir = Math.sign(playerTarget.center.z - o.position.z) || 1;
+  const faceDir = sign;
   o.rotation.y = faceDir > 0 ? 0 : Math.PI;
 
-  o.position.z = THREE.MathUtils.clamp(o.position.z, -6.8, 6.8);
-
-  // weapon arm: extension aims the blade at the player's chest;
-  // during a parry it drives at the player's blade instead (opposition)
+  // weapon arm: aim at the player's chest; during a parry, drive at the player's blade
   const arm = opp.armPivot;
   const target = _t2.set(playerTarget.center.x, playerTarget.center.y + 0.15, playerTarget.center.z);
   if (ai.state === 'parry') {
-    target.set((pBase.x + pTip.x) / 2, (pBase.y + pTip.y) / 2, (pBase.z + pTip.z) / 2);
+    // opposition: aim through the player's blade, gliding from their foible
+    // toward their forte — the rods stay crossed so the press never breaks
+    const slide = THREE.MathUtils.lerp(0.6, 0.2, THREE.MathUtils.clamp(ai.stateTime / 0.3, 0, 1));
+    _t3.copy(pBlade.root).addScaledVector(pBlade.dir, slide * pBlade.len);
+    target.copy(_t3);
+    // follow-offset: always press a little past wherever the blade is now,
+    // so the carry is sustained as the blade gives ground
+    target.x += ai.parryDir * PH.parryPress;
+  }
+
+  // once the drive is committed the arm is ballistic — no mid-lunge re-aiming.
+  // this is what makes beats, deflections and dodges pay off.
+  if (ai.attacking && (ai.state === 'lunge' || ai.state === 'riposte')) {
+    if (!ai.aimFrozen) { ai.aimFrozen = true; ai.frozenAim.copy(target); }
+    target.copy(ai.frozenAim);
+  } else {
+    ai.aimFrozen = false;
   }
   arm.updateMatrixWorld();
   const armPos = _t3.setFromMatrixPosition(arm.matrixWorld);
   const aim = _t1.subVectors(target, armPos).normalize();
 
-  // blend between relaxed guard pose and full-extension aim
   const relaxedPitch = -0.25, relaxedYaw = faceDir > 0 ? 0.15 : Math.PI - 0.15;
   const aimYaw = Math.atan2(aim.x, aim.z);
   const aimPitch = -Math.asin(THREE.MathUtils.clamp(aim.y, -1, 1)) + 0.02;
   const localYaw = faceDir > 0 ? aimYaw : aimYaw - Math.PI;
 
-  let yaw = THREE.MathUtils.lerp(relaxedYaw - (faceDir > 0 ? 0 : Math.PI), localYaw, ai.ext);
-  let pitch = THREE.MathUtils.lerp(relaxedPitch, aimPitch, ai.ext);
-
-  // parry: small lateral beat across the incoming blade
-  if (ai.state === 'parry') {
-    yaw += ai.parryDir * 0.18;
-  }
+  // a parry aims the blade precisely regardless of arm extension
+  const aimBlend = ai.state === 'parry' ? 1 : ai.ext;
+  const yaw = THREE.MathUtils.lerp(relaxedYaw - (faceDir > 0 ? 0 : Math.PI), localYaw, aimBlend);
+  const pitch = THREE.MathUtils.lerp(relaxedPitch, aimPitch, aimBlend);
 
   arm.rotation.set(pitch, yaw, 0);
-  // reach: slide sword forward with extension + lunge
-  opp.sword.position.z = 0.55 + ai.ext * 0.18 + ai.lungeZ * 0.5;
-  arm.position.z = 0.1 + ai.lungeZ * 0.5;
+  opp.sword.position.z = 0.55 + ai.ext * 0.25;
+
+  // grip strength by intent
+  oBlade.stiffness = ai.state === 'parry' ? PH.oppParryK : (ai.attacking ? PH.oppAttackK : PH.oppGuardK);
+  oBlade.damping = 1.7 * Math.sqrt(oBlade.stiffness);
+  oBlade.yield = ai.state === 'parry' ? PH.parryYield : 1;
+}
+
+/* ---------------- Blade physics step + contact feedback ---------------- */
+
+const pTipVel = new THREE.Vector3(), oTipVel = new THREE.Vector3();
+const _rootV = new THREE.Vector3(), _dirV = new THREE.Vector3();
+let clashTimer = 0, scrapeTimer = 0;
+
+function swordWorldPose(sword, outRoot, outDir) {
+  sword.getWorldPosition(outRoot);
+  sword.getWorldQuaternion(_q);
+  outDir.set(0, 0, -1).applyQuaternion(_q);
+}
+
+function stepBladePhysics(dt) {
+  rig.updateMatrixWorld(true);
+  opp.group.updateMatrixWorld(true);
+
+  swordWorldPose(playerSword, _rootV, _dirV);
+  pBlade.setTargets(_rootV, _dirV, dt);
+  swordWorldPose(opp.sword, _rootV, _dirV);
+  oBlade.setTargets(_rootV, _dirV, dt);
+
+  pBlade.tipPrev.copy(pBlade.tipNow);
+  oBlade.tipPrev.copy(oBlade.tipNow);
+
+  let strongest = null;
+  const sdt = dt / PH.substeps;
+  for (let k = 0; k < PH.substeps; k++) {
+    pBlade.substep(sdt);
+    oBlade.substep(sdt);
+    const ev = bladeContact(pBlade, oBlade);
+    if (ev && (!strongest || ev.impact > strongest.impact)) strongest = ev;
+  }
+
+  pBlade.tip(pBlade.tipNow);
+  oBlade.tip(oBlade.tipNow);
+  if (dt > 0) {
+    pTipVel.subVectors(pBlade.tipNow, pBlade.tipPrev).divideScalar(dt);
+    oTipVel.subVectors(oBlade.tipNow, oBlade.tipPrev).divideScalar(dt);
+  }
+
+  // a hard beat on a committed attack jolts the attacker's arm — their
+  // frozen aim shifts with the blow, so a good beat makes the attack miss
+  if (strongest && strongest.impact > PH.shockThreshold && ai.attacking && ai.aimFrozen) {
+    ai.frozenAim.x -= strongest.nx * Math.min(0.3, strongest.impact * PH.beatAimShake);
+    ai.frozenAim.y -= strongest.ny * Math.min(0.3, strongest.impact * PH.beatAimShake);
+    ai.frozenAim.z -= strongest.nz * Math.min(0.3, strongest.impact * PH.beatAimShake);
+  }
+
+  // --- contact feedback: sound + haptics scaled by impact, pitched by position ---
+  clashTimer -= dt; scrapeTimer -= dt;
+  if (strongest) {
+    if (strongest.impact > 0.55 && clashTimer <= 0) {
+      clashTimer = 0.1;
+      const inten = Math.min(1, strongest.impact / 4);
+      audio.clash(inten, strongest.sB);
+      pulseHaptic(0.25 + 0.7 * inten, 18 + inten * 35);
+      // hard beats visibly shiver the blades
+      _t1.crossVectors(pBlade.dir, oBlade.dir);
+      if (_t1.lengthSq() > 1e-6) {
+        pBlade.kickFlex(strongest.impact * 0.25, _t1.normalize());
+        oBlade.kickFlex(-strongest.impact * 0.25, _t1);
+      }
+    } else if (strongest.slide > 0.35 && scrapeTimer <= 0) {
+      scrapeTimer = 0.08;
+      audio.scrape(Math.min(1, strongest.slide / 2.5));
+      pulseHaptic(0.15, 12);
+    }
+  }
+
+  // --- emergent parry/beat messages from actual blade deflection ---
+  if (match.phase === 'fencing') {
+    if (ai.state === 'parry' && !ai.parryMsg && pBlade.deflection() > 0.28) {
+      ai.parryMsg = true;
+      match.priority = 'opponent';
+      showMessage('Parried!', 0.8);
+    }
+    if (ai.attacking && !ai.beatMsg && oBlade.deflection() > 0.33) {
+      ai.beatMsg = true;
+      match.priority = 'player';
+      showMessage('Deflected!', 0.7);
+    }
+  }
 }
 
 /* ---------------- Combat resolution ---------------- */
 
-const pBase = new THREE.Vector3(), pTip = new THREE.Vector3();
-const oBase = new THREE.Vector3(), oTip = new THREE.Vector3();
-const prevPTip = new THREE.Vector3(), prevOTip = new THREE.Vector3();
-const sweptP = new THREE.Vector3(), sweptO = new THREE.Vector3(); // last frame's tips, for swept checks
-const pTipVel = new THREE.Vector3(), oTipVel = new THREE.Vector3();
-let clashCooldown = 0;
-
-function registerTouch(side, off = false) {
-  // side: 'player' | 'opponent'; off = off-target (foil)
-  if (match.phase !== 'fencing') {
-    if (!match.lock) return;
-  }
+function registerTouch(side) {
+  if (match.phase !== 'fencing' && !match.lock) return;
   if (!match.lock) {
     match.lock = { timer: CONFIG.lockout, touches: {} };
     match.phase = 'lockout';
   }
-  const key = off ? side + 'Off' : side;
-  if (match.lock.touches[key]) return;
-  match.lock.touches[key] = true;
-  audio.buzzer(off ? 220 : (side === 'player' ? 520 : 440), 0.5);
-  pulseHaptic(0.8, 120);
+  if (match.lock.touches[side]) return;
+  match.lock.touches[side] = true;
+  audio.buzzer(side === 'player' ? 520 : 440, 0.5);
+  pulseHaptic(0.9, 120);
 }
 
 function resolveLock() {
   const t = match.lock.touches;
   match.lock = null;
-  const W = WEAPONS[weaponKey];
 
   const pOn = !!t.player, oOn = !!t.opponent;
-  const pOff = !!t.playerOff, oOff = !!t.opponentOff;
-
-  setLights({
-    player: pOn, opp: oOn,
-    playerWhite: pOff, oppWhite: oOff,
-  });
+  setLights({ player: pOn, opp: oOn });
 
   let msg = '';
   if (pOn && oOn) {
-    if (weaponKey === 'epee') {
-      match.scorePlayer++; match.scoreOpp++;
-      msg = 'Double touch!';
-    } else {
-      // simplified right of way
-      if (match.priority === 'player') { match.scorePlayer++; msg = 'Attack touch — you!'; }
-      else if (match.priority === 'opponent') { match.scoreOpp++; msg = 'Attack touch — opponent'; }
-      else { msg = 'Simultaneous — no touch'; }
-    }
+    match.scorePlayer++; match.scoreOpp++;
+    msg = 'Double touch!';
   } else if (pOn) {
     match.scorePlayer++;
     msg = 'Touch!';
   } else if (oOn) {
     match.scoreOpp++;
     msg = 'Touch against';
-  } else if (pOff || oOff) {
-    msg = 'Off target — halt';
   }
 
   showMessage(msg, CONFIG.resetPause);
@@ -713,99 +1071,79 @@ function endBout() {
 }
 
 function resetPhrase() {
-  // return to en-garde lines
   opp.group.position.z = -2;
-  ai.lungeZ = 0; ai.ext = 0.15;
+  ai.vel = 0;
+  ai.ext = 0.15;
   ai.reactTimer = 0; ai.attacking = false;
   aiSetState('engarde');
   if (!renderer.xr.isPresenting) rig.position.z = 2;
   else {
-    // in VR shift the rig so the player's head is back at z=+2
     const head = new THREE.Vector3();
     camera.getWorldPosition(head);
     rig.position.z += 2 - head.z;
     rig.position.x -= head.x;
   }
   desktop.lungeT = 0;
+  pBlade.reset();
+  oBlade.reset();
   match.priority = null;
   setLights({});
   match.phase = 'fencing';
   showMessage('En garde … Allez!', 1.0);
 }
 
+const _flexKick = new THREE.Vector3();
+
 function updateCombat(dt) {
-  bladeSegment(playerSword, pBase, pTip);
-  bladeSegment(opp.sword, oBase, oTip);
-
-  if (dt > 0) {
-    pTipVel.subVectors(pTip, prevPTip).divideScalar(dt);
-    oTipVel.subVectors(oTip, prevOTip).divideScalar(dt);
-  }
-  sweptP.copy(prevPTip); prevPTip.copy(pTip);
-  sweptO.copy(prevOTip); prevOTip.copy(oTip);
-
-  clashCooldown -= dt;
-
-  // ---- blade-on-blade contact ----
-  const bladeDist = segmentSegmentDistance(pBase, pTip, oBase, oTip);
-  if (bladeDist < CONFIG.clashDist && clashCooldown <= 0) {
-    clashCooldown = 0.18;
-    audio.clash();
-    pulseHaptic(0.4, 40);
-
-    // A parry beats the attack: defender takes priority
-    if (ai.state === 'parry') {
-      match.priority = 'opponent';
-    } else if (ai.attacking && pTipVel.length() > 1.0) {
-      // player's blade actively met the opponent's during their attack → parry
-      match.priority = 'player';
-      showMessage('Parried!', 0.7);
-      if (ai.state === 'lunge' || ai.state === 'riposte') aiSetState('recover');
-    }
-  }
-
   if (match.phase !== 'fencing' && match.phase !== 'lockout') return;
 
   const W = WEAPONS[weaponKey];
 
-  // ---- player scoring: tip vs opponent body parts ----
+  // ---- player scoring: physical tip, thrust-force model ----
+  // valid épée touch: the swept tip crosses the target AND the tip is being
+  // driven along the blade axis (the 750g-tip-force proxy) — not slapped across it
   const pSpeed = pTipVel.length();
-  const towardOpp = pTipVel.z < -0.2; // tip must be moving toward the opponent
-  const parryBlocks = ai.state === 'parry'; // a won parry roll deflects the attack
-
-  for (const part of opp.parts) {
-    const c = _t1.setFromMatrixPosition(part.node.matrixWorld);
-    const d = pointSegmentDistance(c, pBase, pTip);
-    // thrust: swept tip path crosses the part (robust against frame tunneling)
-    const tipD = pointSegmentDistance(c, sweptP, pTip);
-    const thrust = tipD < part.radius && pSpeed > CONFIG.touchSpeed && towardOpp;
-    const cut = W.cuts && d < part.radius && pSpeed > CONFIG.cutSpeed;
-    if (thrust || cut) {
-      if (parryBlocks) {
-        if (!ai.parryFeedback) {
-          ai.parryFeedback = true;
-          audio.clash();
-          pulseHaptic(0.5, 60);
-          showMessage('Parried!', 0.8);
-          match.priority = 'opponent';
+  if (pSpeed > 1e-3) {
+    const axial = pTipVel.dot(pBlade.dir);
+    const alignment = axial / pSpeed;
+    if (axial > CONFIG.touch.axialSpeed && alignment > CONFIG.touch.alignment) {
+      for (const part of opp.parts) {
+        const c = _t1.setFromMatrixPosition(part.node.matrixWorld);
+        if (pointSegmentDistance(c, pBlade.tipPrev, pBlade.tipNow) < part.radius) {
+          // point-first: the blade axis must drive into the surface, not skid across it
+          _t3.subVectors(c, pBlade.tipNow).normalize();
+          if (pBlade.dir.dot(_t3) < CONFIG.touch.pointFirst) break;
+          if (W.target.includes(part.zone)) {
+            registerTouch('player');
+            // blade bows on the touch
+            _flexKick.copy(pTipVel).addScaledVector(pBlade.dir, -axial);
+            if (_flexKick.lengthSq() < 1e-4) _flexKick.set(0, 1, 0);
+            _t2.crossVectors(pBlade.dir, _flexKick.normalize());
+            if (_t2.lengthSq() > 1e-6) pBlade.kickFlex(Math.min(3, axial * 0.8), _t2.normalize());
+          }
+          break;
         }
-      } else if (W.target.includes(part.zone)) registerTouch('player');
-      else if (W.offTarget.includes(part.zone)) registerTouch('player', true);
-      // sabre below the waist: no light at all
-      break;
+      }
     }
   }
 
-  // ---- opponent scoring: their swept tip vs player capsule ----
+  // ---- opponent scoring: same force model against the player capsule ----
   playerTarget.update();
-  const oTipD = pointSegmentDistance(playerTarget.center, sweptO, oTip);
   const oSpeed = oTipVel.length();
-  if (ai.attacking && oTipD < playerTarget.radius + 0.12 && oSpeed > 0.6) {
-    registerTouch('opponent');
-    aiSetState('recover');
+  if (ai.attacking && oSpeed > 1e-3) {
+    const axialO = oTipVel.dot(oBlade.dir);
+    const alignO = axialO / oSpeed;
+    _t3.subVectors(playerTarget.center, oBlade.tipNow).normalize();
+    if (axialO > CONFIG.touch.axialSpeed * 0.8 && alignO > CONFIG.touch.alignment &&
+        oBlade.dir.dot(_t3) > CONFIG.touch.pointFirst &&
+        pointSegmentDistance(playerTarget.center, oBlade.tipPrev, oBlade.tipNow) < playerTarget.radius + 0.12) {
+      registerTouch('opponent');
+      _t2.crossVectors(oBlade.dir, _t1.set(0, 1, 0));
+      if (_t2.lengthSq() > 1e-6) oBlade.kickFlex(Math.min(3, axialO * 0.8), _t2.normalize());
+      aiSetState('recover');
+    }
   }
 
-  // ---- lockout countdown ----
   if (match.lock) {
     match.lock.timer -= dt;
     if (match.lock.timer <= 0) resolveLock();
@@ -816,7 +1154,7 @@ function updateCombat(dt) {
 
 const desktop = {
   yaw: 0, pitch: 0,
-  thrustT: 0,        // 0..1 thrust animation
+  thrustT: 0,
   thrusting: false,
   lunge: false,
   lungeT: 0,
@@ -865,7 +1203,6 @@ document.addEventListener('keyup', (e) => { desktop.keys[e.code] = false; });
 function updateDesktop(dt) {
   if (renderer.xr.isPresenting) return;
 
-  // footwork
   let move = 0;
   if (desktop.keys['KeyW']) move -= 1;
   if (desktop.keys['KeyS']) move += 1;
@@ -874,7 +1211,6 @@ function updateDesktop(dt) {
     rig.position.z = THREE.MathUtils.clamp(rig.position.z, 0.6, 6.8);
   }
 
-  // camera: fixed en-garde eye, slight lean with blade
   camera.position.set(0, 1.62, 0);
   camera.rotation.set(desktop.pitch * 0.12, desktop.yaw * 0.12, 0);
 
@@ -888,7 +1224,6 @@ function updateDesktop(dt) {
     desktop.lungeT + (desktop.lunge ? dt / 0.35 : -dt / 0.5), 0, 1);
   if (match.phase === 'fencing') rig.position.z += (prevLunge - desktop.lungeT) * 0.85;
 
-  // blade pose from mouse
   handAnchor.rotation.set(desktop.pitch, desktop.yaw, 0);
   handAnchor.position.set(0.22, 1.25 - desktop.thrustT * 0.06, -0.35 - desktop.thrustT * 0.42);
 }
@@ -923,13 +1258,13 @@ controllers.forEach((controller, i) => {
 function attachSwordToVR() {
   handAnchor.remove(playerSword);
   playerSword.position.set(0, 0, 0.02);
-  playerSword.rotation.set(-0.5, 0, 0); // natural grip angle
+  playerSword.rotation.set(-0.5, 0, 0);
   vrWeaponController.grip.add(playerSword);
+  pBlade.reset();
 }
 
 renderer.xr.addEventListener('sessionstart', () => {
   if (vrWeaponController) attachSwordToVR();
-  // place the rig so the player stands at the en-garde line facing the opponent
   rig.position.set(0, 0, 2);
 });
 renderer.xr.addEventListener('sessionend', () => {
@@ -937,14 +1272,14 @@ renderer.xr.addEventListener('sessionend', () => {
   playerSword.position.set(0, 0, 0);
   playerSword.rotation.set(0, 0, 0);
   handAnchor.add(playerSword);
+  pBlade.reset();
 });
 
 function updateVR(dt) {
   if (!renderer.xr.isPresenting) return;
-  // left stick: advance / retreat along the piste
   const off = vrOffhandController?.controller.userData.gamepad;
   if (off && off.axes.length >= 4 && match.phase === 'fencing') {
-    const v = off.axes[3]; // forward = -1
+    const v = off.axes[3];
     if (Math.abs(v) > 0.15) {
       rig.position.z += v * 1.8 * dt;
       rig.position.z = THREE.MathUtils.clamp(rig.position.z, -6.8, 6.8);
@@ -955,10 +1290,25 @@ function updateVR(dt) {
 function pulseHaptic(intensity, ms) {
   const gp = vrWeaponController?.controller.userData.gamepad;
   const act = gp?.hapticActuators?.[0];
-  if (act?.pulse) act.pulse(intensity, ms);
+  if (act?.pulse) act.pulse(Math.min(1, intensity), ms);
 }
 
 /* ---------------- Menu ---------------- */
+
+function applyInertiaSetting() {
+  pBlade.stiffness = CONFIG.bladeInertia ? PH.inertiaK : PH.gripK;
+  pBlade.damping = CONFIG.bladeInertia ? PH.inertiaD : PH.gripD;
+}
+applyInertiaSetting();
+
+const inertiaChk = document.getElementById('inertiaChk');
+if (inertiaChk) {
+  inertiaChk.checked = CONFIG.bladeInertia;
+  inertiaChk.addEventListener('change', () => {
+    CONFIG.bladeInertia = inertiaChk.checked;
+    applyInertiaSetting();
+  });
+}
 
 document.getElementById('startBtn').addEventListener('click', () => {
   audio.ensure();
@@ -978,7 +1328,7 @@ const clock = new THREE.Clock();
 updateHud();
 
 // Debug/test hook (harmless in production; lets automated tests drive the sim)
-window.SIM = { match, desktop, rig, opp, ai, CONFIG, WEAPONS, playerSword };
+window.SIM = { match, desktop, rig, opp, ai, CONFIG, WEAPONS, playerSword, pBlade, oBlade, applyInertiaSetting };
 
 function step(dt) {
   window.__testTick?.(dt);
@@ -987,7 +1337,6 @@ function step(dt) {
     if (match.phase === 'fencing' || match.phase === 'lockout') {
       match.time = Math.max(0, match.time - dt);
       if (match.time === 0 && match.phase === 'fencing') {
-        match.phase = 'over';
         endBout();
       }
     }
@@ -998,21 +1347,19 @@ function step(dt) {
 
     updateDesktop(dt);
     updateVR(dt);
-
-    // player tip kinematics for the AI
-    bladeSegment(playerSword, pBase, pTip);
-    const playerApproaching = pTipVel.z < -0.3;
-    updateOpponent(dt, pTip, pTipVel.length(), playerApproaching);
-
+    updateOpponent(dt);
+    stepBladePhysics(dt);
     updateCombat(dt);
 
-    // update timer display once a second-ish
     if (Math.floor(match.time) !== Math.floor(match.time + dt)) updateHud();
   } else {
-    // idle: opponent bobs on guard behind the menu
     updateDesktop(dt);
-    updateOpponent(dt, pTip, 0, false);
+    updateOpponent(dt);
+    stepBladePhysics(dt);
   }
+
+  updateBladeVisual(playerSword, pBlade);
+  updateBladeVisual(opp.sword, oBlade);
 
   renderer.render(scene, camera);
 }

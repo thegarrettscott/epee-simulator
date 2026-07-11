@@ -5,9 +5,12 @@ A VR épée trainer for Meta Quest that runs in the Quest browser — no app ins
 ## Features
 
 - Regulation 14m piste with en-garde, warning and end lines
-- AI opponent with footwork (advance/retreat to keep distance), lunges, parry–riposte
-- Épée rules: whole body is valid target, double touches score for both fencers
-- Blade-on-blade clash detection with sound and controller haptics
+- **Real blade physics**: each blade is a physical rod pinned at the guard with a grip spring. Blade-on-blade contact uses leverage-weighted impulses — forte beats foible — so parries, beats, glides and opposition emerge from the physics rather than dice rolls. Blades visibly bend under contact and bow on touches.
+- **Fencing-true timing**: a surprise attack in tempo from critical distance beats the reaction parry; a telegraphed advance-lunge gets read and parried. The AI reacts faster to blade threats than to footwork.
+- **Opponent momentum**: acceleration-limited footwork with stepping cadence, a readable preparation tell before each lunge, and ballistic committed drives — no mid-lunge re-aiming, so beats and dodges genuinely break attacks.
+- **Épée touch model**: the swept tip must arrive point-first with axial drive (the 750g force proxy) — slaps, whips and grazes don't score. Whole body is target; double touches score for both.
+- Contact feedback: clash sound pitched by position on the blade (tip rings higher), scrape sounds for sliding blades, haptics scaled by impact
+- Optional **blade weight simulation** (menu toggle): grip spring softens so the blade lags and whips like a real épée — off by default for clean point training
 - Scoreboard, scoring lights, 3-minute clock, bout to 15
 
 ## Run locally (desktop test mode)
@@ -49,4 +52,9 @@ Serve with any HTTPS-capable static server (e.g. `npx http-server -S` with a sel
 
 ## Tuning
 
-Everything gameplay-related lives in the `CONFIG` object at the top of `main.js`: opponent speed, reaction time, parry chance, attack frequency, lockout timing, touch speed thresholds. Turn `parryChance`/`attackChance` up as you improve.
+Everything gameplay-related lives in the `CONFIG` object at the top of `main.js`:
+
+- `CONFIG.opponent` — speed, reaction time, parry chance, attack frequency. Turn `parryChance`/`attackChance` up and `reaction` down as you improve.
+- `CONFIG.momentum` — lunge speed/acceleration, the preparation-tell duration, footwork cadence
+- `CONFIG.touch` — axial-speed and point-first thresholds for a valid touch
+- `CONFIG.physics` — grip stiffness, contact behaviour, parry press strength, blade-weight-sim feel
