@@ -528,22 +528,34 @@ function buildOpponent() {
   bib.position.y = -0.12; head.add(bib);
   parts.push({ node: head, zone: 'head', radius: 0.15 });
 
-  const frontThigh = new THREE.Mesh(new THREE.CapsuleGeometry(0.07, 0.34, 4, 10), breeches);
-  frontThigh.position.set(0.02, 0.72, 0.16); frontThigh.rotation.x = 0.55;
-  o.add(frontThigh);
-  const frontShin = new THREE.Mesh(new THREE.CapsuleGeometry(0.055, 0.36, 4, 10), jacket);
-  frontShin.position.set(0.02, 0.3, 0.34); frontShin.rotation.x = -0.15;
-  o.add(frontShin);
-  const backThigh = new THREE.Mesh(new THREE.CapsuleGeometry(0.07, 0.34, 4, 10), breeches);
-  backThigh.position.set(-0.06, 0.72, -0.2); backThigh.rotation.x = -0.7; backThigh.rotation.z = 0.15;
-  o.add(backThigh);
-  const backShin = new THREE.Mesh(new THREE.CapsuleGeometry(0.055, 0.36, 4, 10), jacket);
-  backShin.position.set(-0.09, 0.28, -0.38); backShin.rotation.x = 0.5;
-  o.add(backShin);
-  for (const leg of [frontThigh, frontShin, backThigh, backShin]) {
-    leg.castShadow = true;
-    parts.push({ node: leg, zone: 'leg', radius: 0.11 });
+  // Legs — articulated: hip and knee pivots so footwork and lunges show.
+  // Front leg toward the player (+Z local).
+  function buildLeg(front) {
+    const hip = new THREE.Group();
+    hip.position.set(front ? 0.05 : -0.08, 0.92, front ? 0.1 : -0.14);
+    const thigh = new THREE.Mesh(new THREE.CapsuleGeometry(0.07, 0.3, 4, 10), breeches);
+    thigh.position.y = -0.19;
+    thigh.castShadow = true;
+    hip.add(thigh);
+    const knee = new THREE.Group();
+    knee.position.y = -0.4;
+    hip.add(knee);
+    const shin = new THREE.Mesh(new THREE.CapsuleGeometry(0.055, 0.32, 4, 10), jacket);
+    shin.position.y = -0.19;
+    shin.castShadow = true;
+    knee.add(shin);
+    const foot = new THREE.Mesh(new THREE.BoxGeometry(0.09, 0.05, 0.26), dark);
+    foot.position.set(0, -0.41, 0.07);
+    foot.castShadow = true;
+    knee.add(foot);
+    o.add(hip);
+    parts.push({ node: thigh, zone: 'leg', radius: 0.11 });
+    parts.push({ node: shin, zone: 'leg', radius: 0.1 });
+    parts.push({ node: foot, zone: 'leg', radius: 0.09 });
+    return { hip, knee };
   }
+  const legF = buildLeg(true);
+  const legB = buildLeg(false);
 
   const backArm = new THREE.Mesh(new THREE.CapsuleGeometry(0.05, 0.3, 4, 10), jacket);
   backArm.position.set(-0.14, 1.28, -0.14); backArm.rotation.z = 0.9; backArm.rotation.x = -0.8;
@@ -576,7 +588,7 @@ function buildOpponent() {
 
   scene.add(o);
 
-  return { group: o, parts, armPivot, sword, torso, head };
+  return { group: o, parts, armPivot, sword, torso, head, legF, legB, backArm };
 }
 
 const opp = buildOpponent();
@@ -735,6 +747,8 @@ const ai = {
   reactTimer: 0,
   bob: Math.random() * 10,
   prevDist: 2.05,
+  stepPhase: 0,            // leg-cycle phase, advances with body speed
+  lungeT: 0,               // 0 en-garde → 1 full lunge pose
   attacking: false,
   parryMsg: false,         // 'Parried!' shown for this parry
   beatMsg: false,          // 'Deflected!' shown for this attack
@@ -884,8 +898,26 @@ function updateOpponent(dt) {
   // --- pose / animation ---
   ai.ext = THREE.MathUtils.damp(ai.ext, ai.extTarget, 12, dt);
 
+  // lunge pose blend: snaps in with the drive, releases through the recovery
+  const lungeTarget = ai.attacking ? 1 : (inTell ? 0.18 : 0);
+  ai.lungeT = THREE.MathUtils.damp(ai.lungeT, lungeTarget, ai.attacking ? 16 : 7, dt);
+  const L = ai.lungeT;
+
+  // footwork: legs shuffle with actual body speed (front foot leads, back follows)
+  ai.stepPhase += Math.abs(ai.vel) * dt * 9;
+  const stepF = Math.sin(ai.stepPhase) * 0.16 * (1 - L);
+  const stepB = Math.sin(ai.stepPhase - Math.PI * 0.6) * 0.13 * (1 - L);
+  opp.legF.hip.rotation.x = 0.42 + stepF + L * 0.55;
+  opp.legF.knee.rotation.x = -0.55 - Math.max(0, Math.sin(ai.stepPhase)) * 0.22 * (1 - L) - L * 0.5;
+  opp.legB.hip.rotation.x = -0.5 + stepB - L * 0.38;
+  opp.legB.knee.rotation.x = 0.65 - L * 0.55;
+
+  // torso drives forward and down into the lunge; back arm throws back
+  opp.torso.rotation.x = 0.14 + L * 0.32;
+  opp.backArm.rotation.x = -0.8 - L * 0.6;
+
   const bobY = Math.sin(ai.bob * 2.1) * 0.015 + Math.sin(ai.bob * 5.3) * 0.006;
-  const dip = inTell ? 0.03 * (ai.stateTime / M.tellTime) : (ai.attacking ? 0.06 : 0);
+  const dip = inTell ? 0.035 * (ai.stateTime / M.tellTime) : L * 0.13;
   o.position.y = bobY - dip;
 
   const faceDir = sign;
