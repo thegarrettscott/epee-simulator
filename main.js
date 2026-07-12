@@ -365,12 +365,40 @@ function closestSegSeg(p1, q1, p2, q2, out) {
 }
 
 const _cn = new THREE.Vector3(), _cvA = new THREE.Vector3(), _cvB = new THREE.Vector3();
-const _tA = new THREE.Vector3(), _tB = new THREE.Vector3();
+const _tA = new THREE.Vector3(), _tB = new THREE.Vector3(), _cx = new THREE.Vector3();
+const crossState = { side: 0 }; // which side of each other the blades are on
 
 // one blade-vs-blade contact solve; returns event info or null
 function bladeContact(A, B) {
   A.tip(_tA); B.tip(_tB);
   closestSegSeg(A.root, _tA, B.root, _tB, _sp);
+
+  // ---- hard non-crossing: steel cannot pass through steel ----
+  // Track the signed separation along the blades' common perpendicular.
+  // A sign flip with both closest points on the blades' interior means a
+  // blade tunneled through the other this substep — project it back.
+  // (Flips beyond a tip are legal: that is a disengage around the point.)
+  _cx.crossVectors(A.dir, B.dir);
+  const cxLen = _cx.length();
+  if (cxLen > 1e-4) {
+    _cx.divideScalar(cxLen);
+    const signed = _b3.subVectors(_sp.pA, _sp.pB).dot(_cx);
+    const side = signed >= 0 ? 1 : -1;
+    const interior = _sp.s > 0.04 && _sp.s < 0.96 && _sp.t > 0.04 && _sp.t < 0.96;
+    if (crossState.side !== 0 && side !== crossState.side && interior && _sp.dist < 0.14) {
+      const wA = (_sp.s * _sp.s + PH.leverageEps) * A.yield;
+      const wB = (_sp.t * _sp.t + PH.leverageEps) * B.yield;
+      const wSum = wA + wB;
+      const corr = PH.contactRadius * crossState.side - signed;
+      A.displaceAt(_sp.s, _b3.copy(_cx).multiplyScalar(corr * wA / wSum));
+      B.displaceAt(_sp.t, _b3.copy(_cx).multiplyScalar(-corr * wB / wSum));
+      A.tip(_tA); B.tip(_tB);
+      closestSegSeg(A.root, _tA, B.root, _tB, _sp);
+    } else {
+      crossState.side = side;
+    }
+  }
+
   if (_sp.dist >= PH.contactRadius) return null;
 
   if (_sp.dist > 1e-6) _cn.subVectors(_sp.pA, _sp.pB).divideScalar(_sp.dist);
@@ -511,12 +539,31 @@ function buildOpponent() {
 
   const parts = []; // { node, zone, radius }
 
+  // torso — profiled fencing stance: deeper than wide, weapon shoulder leading
   const torso = new THREE.Mesh(new THREE.CapsuleGeometry(0.17, 0.42, 6, 14), jacket);
   torso.position.set(0, 1.12, 0);
-  torso.rotation.x = 0.14;
+  torso.scale.set(0.76, 1, 1.16);
+  torso.rotation.set(0.14, -0.5, 0);
   torso.castShadow = true;
   o.add(torso);
-  parts.push({ node: torso, zone: 'torso', radius: 0.21 });
+  parts.push({ node: torso, zone: 'torso', radius: 0.2 });
+
+  // shoulder line, weapon shoulder forward
+  const shoulders = new THREE.Mesh(new THREE.CapsuleGeometry(0.055, 0.24, 4, 10), jacket);
+  shoulders.position.set(0.02, 1.4, 0.02);
+  shoulders.rotation.set(Math.PI / 2 - 0.12, 0, -0.35);
+  shoulders.castShadow = true;
+  o.add(shoulders);
+  parts.push({ node: shoulders, zone: 'torso', radius: 0.14 });
+
+  // hips, also profiled
+  const pelvis = new THREE.Mesh(new THREE.SphereGeometry(0.15, 14, 10), breeches);
+  pelvis.position.set(0, 0.94, -0.02);
+  pelvis.scale.set(0.75, 0.65, 1.15);
+  pelvis.rotation.y = -0.4;
+  pelvis.castShadow = true;
+  o.add(pelvis);
+  parts.push({ node: pelvis, zone: 'torso', radius: 0.16 });
 
   const head = new THREE.Mesh(new THREE.SphereGeometry(0.115, 20, 16), dark);
   head.position.set(0, 1.58, 0.04);
@@ -536,7 +583,7 @@ function buildOpponent() {
   // Front leg toward the player (+Z local).
   function buildLeg(front) {
     const hip = new THREE.Group();
-    hip.position.set(front ? 0.05 : -0.08, 0.92, front ? 0.1 : -0.14);
+    hip.position.set(front ? 0.06 : -0.1, 0.92, front ? 0.16 : -0.2);
     const thigh = new THREE.Mesh(new THREE.CapsuleGeometry(0.07, 0.3, 4, 10), breeches);
     thigh.position.y = -0.19;
     thigh.castShadow = true;
@@ -550,6 +597,7 @@ function buildOpponent() {
     knee.add(shin);
     const foot = new THREE.Mesh(new THREE.BoxGeometry(0.09, 0.05, 0.26), dark);
     foot.position.set(0, -0.41, 0.07);
+    if (!front) { foot.rotation.y = 1.35; foot.position.z = 0.02; } // back foot turned out
     foot.castShadow = true;
     knee.add(foot);
     o.add(hip);
@@ -561,11 +609,12 @@ function buildOpponent() {
   const legF = buildLeg(true);
   const legB = buildLeg(false);
 
-  const backArm = new THREE.Mesh(new THREE.CapsuleGeometry(0.05, 0.3, 4, 10), jacket);
-  backArm.position.set(-0.14, 1.28, -0.14); backArm.rotation.z = 0.9; backArm.rotation.x = -0.8;
+  // rear arm: hangs relaxed behind the rear hip, modern épée carriage
+  const backArm = new THREE.Mesh(new THREE.CapsuleGeometry(0.045, 0.28, 4, 10), jacket);
+  backArm.position.set(-0.1, 1.18, -0.2); backArm.rotation.z = 0.25; backArm.rotation.x = -0.35;
   backArm.castShadow = true;
   o.add(backArm);
-  parts.push({ node: backArm, zone: 'arm', radius: 0.1 });
+  parts.push({ node: backArm, zone: 'arm', radius: 0.09 });
 
   // neck
   const neck = new THREE.Mesh(new THREE.CylinderGeometry(0.045, 0.055, 0.08, 10), jacket);
@@ -1043,14 +1092,14 @@ function updateOpponent(dt) {
   ai.stepPhase += Math.abs(ai.vel) * dt * 9;
   const stepF = Math.sin(ai.stepPhase) * 0.16 * (1 - L);
   const stepB = Math.sin(ai.stepPhase - Math.PI * 0.6) * 0.13 * (1 - L);
-  opp.legF.hip.rotation.x = 0.42 + stepF + L * 0.55;
-  opp.legF.knee.rotation.x = -0.55 - Math.max(0, Math.sin(ai.stepPhase)) * 0.22 * (1 - L) - L * 0.5;
-  opp.legB.hip.rotation.x = -0.5 + stepB - L * 0.38;
-  opp.legB.knee.rotation.x = 0.65 - L * 0.55;
+  opp.legF.hip.rotation.x = 0.48 + stepF + L * 0.52;
+  opp.legF.knee.rotation.x = -0.62 - Math.max(0, Math.sin(ai.stepPhase)) * 0.22 * (1 - L) - L * 0.45;
+  opp.legB.hip.rotation.x = -0.55 + stepB - L * 0.35;
+  opp.legB.knee.rotation.x = 0.75 - L * 0.62;
 
   // torso drives forward and down into the lunge; back arm throws back
   opp.torso.rotation.x = 0.14 + L * 0.32;
-  opp.backArm.rotation.x = -0.8 - L * 0.6;
+  opp.backArm.rotation.x = -0.35 - L * 1.1; // throws back on the lunge
 
   const bobY = Math.sin(ai.bob * 2.1) * 0.015 + Math.sin(ai.bob * 5.3) * 0.006;
   const dip = inTell ? 0.035 * (ai.stateTime / M.tellTime) : L * 0.13;
@@ -1076,13 +1125,14 @@ function updateOpponent(dt) {
     else if (tName === 'mask') target.copy(playerVols[2].pos);
     else target.set(playerTarget.center.x, playerTarget.center.y + 0.15, playerTarget.center.z);
 
-    // feint: show one line, then disengage around the parry into another
+    // feint: show one line, then disengage UNDER the point into another —
+    // blades can't pass through each other, so the route is around the tip
     if (ai.plan?.type === 'feint' && ai.attacking) {
       const dT = ai.stateTime - M.tellTime;
       if (dT > 0.14 && dT < 0.3) {
         const s = Math.sin(((dT - 0.14) / 0.16) * Math.PI);
         target.x += ai.plan.disengageDir * 0.3 * s;
-        target.y -= 0.08 * s;
+        target.y -= 0.24 * s;
       }
     }
 
@@ -1106,7 +1156,7 @@ function updateOpponent(dt) {
   // --- pose the arm chain: two-bone IK toward the aim, wrist steers the point ---
   _ikT.copy(target).sub(o.position);
   _ikT.x *= faceDir; _ikT.z *= faceDir; // world → group-local (yaw is 0 or π)
-  const S = _ikS.set(0.17, 1.4, 0.12 + L * 0.22 + ai.vel * faceDir * 0.02);
+  const S = _ikS.set(0.09, 1.4, 0.16 + L * 0.22 + ai.vel * faceDir * 0.02);
   _ikD.subVectors(_ikT, S).normalize();
   const reach = 0.34 + ai.ext * 0.34;
   const H = _ikH.copy(S).addScaledVector(_ikD, reach);
@@ -1302,6 +1352,7 @@ function resetPhrase() {
   desktop.lungeT = 0;
   pBlade.reset();
   oBlade.reset();
+  crossState.side = 0;
   match.priority = null;
   setLights({});
   match.phase = 'fencing';
