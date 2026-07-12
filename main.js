@@ -79,6 +79,23 @@ const WEAPONS = {
 
 const weaponKey = 'epee';
 
+const TRAINING_MODES = {
+  bout: { label: 'Full bout', time: 180, score: 15, objective: 'Fence a complete three-minute bout to 15.' },
+  distance: { label: 'Distance control', time: 60, score: 999, objective: 'Stay at effective measure (1.85–2.35 m) without being hit.' },
+  parry: { label: 'Parry–riposte', time: 75, score: 8, objective: 'Deflect the committed attack, then land the riposte.' },
+  stop: { label: 'Stop hit', time: 75, score: 8, objective: 'Hit during the opponent’s preparation or committed drive.' },
+  hand: { label: 'Hand pick', time: 75, score: 10, objective: 'Control the point and score specifically on the weapon arm or hand.' },
+  double: { label: 'No doubles', time: 90, score: 10, objective: 'Score cleanly. Every double touch counts against the drill.' },
+};
+
+const OPPONENT_STYLES = {
+  beginner: { speed: 1.05, attackChance: 0.30, parryChance: 0.38, reaction: 0.28, weights: { simple: 2.5, feint: .2, beat: .1, armPick: .3, trap: .1, second: .1 } },
+  pressure: { speed: 1.85, attackChance: .85, parryChance: .55, reaction: .17, preferredDist: 1.75, weights: { simple: 1.8, feint: .5, beat: .5, armPick: .4, trap: .15, second: .25 } },
+  counter: { speed: 1.55, attackChance: .42, parryChance: .76, reaction: .12, preferredDist: 2.35, weights: { simple: .5, feint: .7, beat: .3, armPick: 1.4, trap: 1.8, second: .8 } },
+  blade: { speed: 1.4, attackChance: .58, parryChance: .84, reaction: .14, weights: { simple: .4, feint: 1, beat: 2.2, armPick: .5, trap: .4, second: 1.3 } },
+  adaptive: { speed: 1.5, attackChance: .55, parryChance: .72, reaction: .14, preferredDist: 2.05, weights: { simple: 1, feint: .9, beat: .7, armPick: .9, trap: .5, second: .5 } },
+};
+
 /* ---------------- Renderer / scene ---------------- */
 
 const renderer = new THREE.WebGLRenderer({ antialias: true });
@@ -795,7 +812,52 @@ const match = {
   lock: null,
   haltTimer: 0,
   boardMsg: '',
+  mode: 'bout',
+  style: 'adaptive',
+  overtime: false,
+  paused: false,
 };
+
+let session = null;
+function freshSession() {
+  return {
+    startedAt: Date.now(), attacks: 0, touchesFor: 0, touchesAgainst: 0, doubles: 0,
+    parries: 0, ripostes: 0, handHits: 0, cleanHits: 0, measureTime: 0,
+    totalFencingTime: 0, zones: {}, lastAttackAt: 0, lastParryAt: 0,
+  };
+}
+
+function coach(text, dur = 2.1) {
+  const el = document.getElementById('coach');
+  el.textContent = text; el.classList.add('show');
+  clearTimeout(coach._timer);
+  coach._timer = setTimeout(() => el.classList.remove('show'), dur * 1000);
+}
+
+function saveSession(summary) {
+  try {
+    const history = JSON.parse(localStorage.getItem('epeeSessions') || '[]');
+    history.unshift(summary);
+    localStorage.setItem('epeeSessions', JSON.stringify(history.slice(0, 20)));
+    localStorage.setItem('epeePrefs', JSON.stringify({ mode: match.mode, style: match.style, inertia: CONFIG.bladeInertia }));
+  } catch (_) {}
+}
+
+function getHistory() {
+  try { return JSON.parse(localStorage.getItem('epeeSessions') || '[]'); } catch (_) { return []; }
+}
+
+function updateDrillHud() {
+  const box = document.getElementById('drillHud');
+  if (match.mode === 'bout' || !match.started) { box.style.display = 'none'; return; }
+  const mode = TRAINING_MODES[match.mode]; box.style.display = 'block';
+  document.getElementById('drillName').textContent = mode.label;
+  document.getElementById('drillObjective').textContent = mode.objective;
+  let progress = `${match.scorePlayer} clean touches`;
+  if (match.mode === 'distance') progress = `${Math.floor(session?.measureTime || 0)}s in measure`;
+  if (match.mode === 'double') progress = `${match.scorePlayer} clean · ${session?.doubles || 0} doubles`;
+  document.getElementById('drillProgress').textContent = progress;
+}
 
 const hud = {
   scoreL: document.getElementById('scoreL'),
@@ -872,6 +934,20 @@ function aiSetState(s) {
   if (s === 'lunge' || s === 'riposte') ai.beatMsg = false;
 }
 
+function applyOpponentStyle(styleKey) {
+  const p = OPPONENT_STYLES[styleKey] || OPPONENT_STYLES.adaptive;
+  CONFIG.opponent.speed = p.speed;
+  CONFIG.opponent.attackChance = p.attackChance;
+  CONFIG.opponent.parryChance = p.parryChance;
+  CONFIG.opponent.reaction = p.reaction;
+  CONFIG.opponent.preferredDist = p.preferredDist || 2.05;
+  CONFIG.opponent.planWeights = { ...p.weights };
+  if (match.mode === 'parry') { CONFIG.opponent.attackChance = .95; CONFIG.opponent.parryChance = .2; }
+  if (match.mode === 'stop') { CONFIG.opponent.attackChance = .82; CONFIG.opponent.reaction += .08; }
+  if (match.mode === 'hand') { CONFIG.opponent.attackChance = .22; CONFIG.opponent.parryChance = .45; }
+  if (match.mode === 'distance') { CONFIG.opponent.attackChance = .38; }
+}
+
 // pick the next action from the repertoire, weighted by what YOU have shown
 function choosePlan(dist) {
   const C = CONFIG.opponent, mem = ai.memory;
@@ -887,6 +963,8 @@ function choosePlan(dist) {
   for (const k in w) sum += w[k];
   let r = Math.random() * sum, type = 'simple';
   for (const k in w) { r -= w[k]; if (r <= 0) { type = k; break; } }
+  if (match.mode === 'parry' || match.mode === 'stop') type = 'simple';
+  if (match.mode === 'hand' && type === 'trap') type = 'simple';
 
   // disengage around the side you habitually parry toward
   const disengageDir = mem.parryR > mem.parryL ? -1 : mem.parryL > mem.parryR ? 1
@@ -1270,11 +1348,14 @@ function stepBladePhysics(dt) {
       ai.parryMsg = true;
       match.priority = 'opponent';
       showMessage('Parried!', 0.8);
+      coach('Your attack was read. Prepare with the blade or change line.');
     }
     if (ai.attacking && !ai.beatMsg && oBlade.deflection() > 0.33) {
       ai.beatMsg = true;
       match.priority = 'player';
       showMessage('Deflected!', 0.7);
+      if (session) { session.parries++; session.lastParryAt = performance.now(); }
+      coach('Good deflection—finish the riposte while the opponent recovers.');
       // learn which side you habitually defend toward
       if (pBlade.tipNow.x > playerTarget.center.x) ai.memory.parryR++;
       else ai.memory.parryL++;
@@ -1303,36 +1384,87 @@ function resolveLock() {
   match.lock = null;
 
   const pOn = !!t.player, oOn = !!t.opponent;
+  const recentParry = !!(session?.lastParryAt && performance.now() - session.lastParryAt < 1500);
   setLights({ player: pOn, opp: oOn });
 
   const zoneTag = (z) => (z && z !== 'body' && z !== 'torso') ? ` — ${z}!` : '!';
   let msg = '';
   if (pOn && oOn) {
     match.scorePlayer++; match.scoreOpp++;
+    if (session) { session.doubles++; session.touchesFor++; session.touchesAgainst++; }
     msg = 'Double touch!';
+    coach('Double touch—recover behind the guard or control the opponent’s blade.');
   } else if (pOn) {
     match.scorePlayer++;
+    if (session) {
+      session.touchesFor++; session.cleanHits++; session.zones[zones.player] = (session.zones[zones.player] || 0) + 1;
+      if (zones.player === 'arm' || zones.player === 'hand') session.handHits++;
+      if (recentParry) session.ripostes++;
+    }
     msg = 'Touch' + zoneTag(zones.player);
+    if (match.mode === 'hand' && zones.player !== 'arm' && zones.player !== 'hand') coach('Valid touch, but this drill scores point control on the weapon arm.');
+    else if (ai.attacking) coach('Good timing—your point arrived during the opponent’s action.');
+    else coach(`Clean touch${zones.player ? ` to ${zones.player}` : ''}.`);
   } else if (oOn) {
     match.scoreOpp++;
+    if (session) session.touchesAgainst++;
     msg = 'Touch against' + zoneTag(zones.opponent);
+    coach(ai.attacking ? 'Late defense—meet the blade earlier or make the opponent fall short.' : 'You entered distance without control. Reset the measure.');
   }
+
+  if (match.mode === 'hand' && pOn && !oOn && zones.player !== 'arm' && zones.player !== 'hand') match.scorePlayer--;
+  if (match.mode === 'parry' && pOn && !oOn && !recentParry) { match.scorePlayer--; coach('Touch landed, but the drill scores only an immediate riposte after blade contact.'); }
+  if (match.mode === 'stop' && pOn && !oOn && !ai.attacking) { match.scorePlayer--; coach('Touch landed outside the attack. Wait for the preparation, then stop-hit in tempo.'); }
+  if (match.mode === 'double' && pOn && oOn) match.scorePlayer = Math.max(0, match.scorePlayer - 2);
 
   showMessage(msg, CONFIG.resetPause);
   match.phase = 'halt';
   match.haltTimer = CONFIG.resetPause;
   updateHud();
+  updateDrillHud();
 
-  if (match.scorePlayer >= CONFIG.boutScore || match.scoreOpp >= CONFIG.boutScore) {
+  if (match.overtime || match.scorePlayer >= CONFIG.boutScore || (match.mode === 'bout' && match.scoreOpp >= CONFIG.boutScore)) {
     endBout();
   }
 }
 
 function endBout() {
   match.phase = 'over';
-  const won = match.scorePlayer > match.scoreOpp;
-  showMessage(won ? '🏆 Bout won!' : 'Bout lost — again!', 5);
-  setTimeout(() => { hud.overlay.style.display = 'flex'; match.started = false; }, 2600);
+  const won = match.mode === 'bout' ? match.scorePlayer > match.scoreOpp : match.scorePlayer >= TRAINING_MODES[match.mode].score;
+  showMessage(won ? 'Session complete!' : 'Time — review your session', 3);
+  setTimeout(showSessionReport, 900);
+}
+
+function showSessionReport() {
+  match.started = false; match.paused = false;
+  document.exitPointerLock?.();
+  document.getElementById('drillHud').style.display = 'none';
+  const s = session || freshSession();
+  const accuracy = s.attacks ? Math.round((s.touchesFor / s.attacks) * 100) : 0;
+  const parryRate = s.parries ? Math.round((s.ripostes / s.parries) * 100) : 0;
+  const cleanRate = s.touchesFor ? Math.round((s.cleanHits / s.touchesFor) * 100) : 0;
+  const mode = TRAINING_MODES[match.mode];
+  const summary = { date: Date.now(), mode: match.mode, style: match.style, scoreFor: match.scorePlayer, scoreAgainst: match.scoreOpp, accuracy, doubles: s.doubles };
+  saveSession(summary);
+  document.getElementById('menuMain').style.display = 'none';
+  document.getElementById('report').style.display = 'block';
+  document.getElementById('reportResult').textContent = `${mode.label} · ${match.scorePlayer}–${match.scoreOpp} · ${OPPONENT_STYLES[match.style] ? match.style : 'adaptive'} opponent`;
+  const metrics = [
+    [accuracy + '%', 'attack conversion'], [s.cleanHits, 'clean touches'], [s.doubles, 'double touches'],
+    [s.parries, 'parries'], [parryRate + '%', 'riposte conversion'],
+    [match.mode === 'distance' ? Math.floor(s.measureTime) + 's' : cleanRate + '%', match.mode === 'distance' ? 'time in measure' : 'clean-hit rate'],
+  ];
+  document.getElementById('reportGrid').innerHTML = metrics.map(([v,l]) => `<div class="metric"><b>${v}</b><span>${l}</span></div>`).join('');
+  let advice = 'Build the next session around distance: arrive in measure with the point threatening, then leave after the action.';
+  if (s.doubles >= 3) advice = 'Priority focus: reduce double touches. Control the blade or make the opponent fall short before finishing.';
+  else if (s.parries >= 2 && parryRate < 40) advice = 'Your defense is finding the blade, but the riposte is late. Make the return immediately from the parry.';
+  else if (accuracy < 25 && s.attacks >= 4) advice = 'Your attack volume is high relative to conversion. Wait for a clearer distance or create the opening with a beat or disengage.';
+  else if (s.handHits >= 3) advice = 'Strong point control on the weapon arm. Next, combine the hand threat with a body finish when the guard reacts.';
+  document.getElementById('reportCoach').textContent = advice;
+  const history = getHistory();
+  const prev = history[1];
+  document.getElementById('historyLine').textContent = prev ? `Previous ${TRAINING_MODES[prev.mode]?.label || 'session'}: ${prev.scoreFor}–${prev.scoreAgainst}, ${prev.accuracy}% conversion` : 'Your results are now saved on this device.';
+  hud.overlay.style.display = 'flex';
 }
 
 function resetPhrase() {
@@ -1456,6 +1588,7 @@ document.addEventListener('mousedown', (e) => {
   if (!desktop.pointerLocked || match.phase !== 'fencing') return;
   audio.ensure();
   desktop.thrusting = true;
+  if (session) { session.attacks++; session.lastAttackAt = performance.now(); }
   if (e.shiftKey) desktop.lunge = true;
   if (!match.priority) match.priority = 'player';
 });
@@ -1467,8 +1600,14 @@ document.addEventListener('mouseup', () => {
 document.addEventListener('keydown', (e) => {
   desktop.keys[e.code] = true;
   if (e.code === 'Escape' && match.started) {
+    match.paused = true;
     hud.overlay.style.display = 'flex';
-    match.started = false;
+    document.getElementById('report').style.display = 'none';
+    document.getElementById('menuMain').style.display = 'block';
+    document.getElementById('menuTitle').style.display = 'none';
+    document.getElementById('pauseTitle').style.display = 'block';
+    document.getElementById('resumeBtn').style.display = 'inline-block';
+    document.getElementById('startBtn').textContent = 'RESTART SESSION';
   }
 });
 document.addEventListener('keyup', (e) => { desktop.keys[e.code] = false; });
@@ -1524,6 +1663,7 @@ controllers.forEach((controller, i) => {
   controller.addEventListener('selectstart', () => {
     if (controller.userData.handedness === 'right' && match.phase === 'fencing') {
       if (!match.priority) match.priority = 'player';
+      if (session) { session.attacks++; session.lastAttackAt = performance.now(); }
     }
   });
 });
@@ -1583,18 +1723,62 @@ if (inertiaChk) {
   });
 }
 
-document.getElementById('startBtn').addEventListener('click', () => {
+function selectChoice(groupId, key, attr) {
+  document.querySelectorAll(`#${groupId} .choice`).forEach((b) => b.classList.toggle('sel', b.dataset[attr] === key));
+}
+
+document.querySelectorAll('#modeChoices .choice').forEach((btn) => btn.addEventListener('click', () => {
+  match.mode = btn.dataset.mode; selectChoice('modeChoices', match.mode, 'mode');
+  document.getElementById('modeDesc').textContent = TRAINING_MODES[match.mode].objective;
+}));
+document.querySelectorAll('#styleChoices .choice').forEach((btn) => btn.addEventListener('click', () => {
+  match.style = btn.dataset.style; selectChoice('styleChoices', match.style, 'style');
+}));
+
+try {
+  const prefs = JSON.parse(localStorage.getItem('epeePrefs') || '{}');
+  if (TRAINING_MODES[prefs.mode]) match.mode = prefs.mode;
+  if (OPPONENT_STYLES[prefs.style]) match.style = prefs.style;
+  if (typeof prefs.inertia === 'boolean') { CONFIG.bladeInertia = prefs.inertia; inertiaChk.checked = prefs.inertia; applyInertiaSetting(); }
+  selectChoice('modeChoices', match.mode, 'mode'); selectChoice('styleChoices', match.style, 'style');
+  document.getElementById('modeDesc').textContent = TRAINING_MODES[match.mode].objective;
+} catch (_) {}
+
+function openMainMenu() {
+  document.getElementById('report').style.display = 'none';
+  document.getElementById('menuMain').style.display = 'block';
+  document.getElementById('menuTitle').style.display = 'block';
+  document.getElementById('pauseTitle').style.display = 'none';
+  document.getElementById('resumeBtn').style.display = 'none';
+  document.getElementById('startBtn').textContent = 'START SESSION';
+}
+
+function startSession() {
   audio.ensure();
+  const mode = TRAINING_MODES[match.mode];
+  CONFIG.boutScore = mode.score; CONFIG.boutTime = mode.time;
+  applyOpponentStyle(match.style);
   hud.overlay.style.display = 'none';
-  match.started = true;
-  match.scorePlayer = 0;
-  match.scoreOpp = 0;
-  match.time = CONFIG.boutTime;
+  document.getElementById('report').style.display = 'none';
+  match.started = true; match.paused = false; match.overtime = false;
+  match.scorePlayer = 0; match.scoreOpp = 0; match.time = mode.time;
+  session = freshSession();
   ai.memory.parryL = 0; ai.memory.parryR = 0; ai.memory.playerAdvances = 0;
-  updateHud();
-  resetPhrase();
+  updateHud(); updateDrillHud(); resetPhrase();
+  coach(mode.objective, 3.4);
+  if (!renderer.xr.isPresenting) renderer.domElement.requestPointerLock();
+}
+
+document.getElementById('startBtn').addEventListener('click', () => {
+  startSession();
+});
+
+document.getElementById('resumeBtn').addEventListener('click', () => {
+  match.paused = false; hud.overlay.style.display = 'none';
   if (!renderer.xr.isPresenting) renderer.domElement.requestPointerLock();
 });
+document.getElementById('menuBtn').addEventListener('click', openMainMenu);
+document.getElementById('againBtn').addEventListener('click', startSession);
 
 /* ---------------- Main loop ---------------- */
 
@@ -1607,11 +1791,18 @@ window.SIM = { match, desktop, rig, opp, ai, CONFIG, WEAPONS, playerSword, pBlad
 function step(dt) {
   window.__testTick?.(dt);
 
-  if (match.started) {
+  if (match.started && !match.paused) {
     if (match.phase === 'fencing' || match.phase === 'lockout') {
       match.time = Math.max(0, match.time - dt);
+      if (session) {
+        session.totalFencingTime += dt;
+        const dist = Math.abs(opp.group.position.z - playerTarget.center.z);
+        if (dist >= 1.85 && dist <= 2.35) session.measureTime += dt;
+      }
       if (match.time === 0 && match.phase === 'fencing') {
-        endBout();
+        if (match.mode === 'bout' && match.scorePlayer === match.scoreOpp && !match.overtime) {
+          match.overtime = true; match.time = 60; showMessage('Priority minute — sudden death', 2.5); coach('Scores are tied. The next touch wins.');
+        } else endBout();
       }
     }
     if (match.phase === 'halt') {
@@ -1624,6 +1815,7 @@ function step(dt) {
     updateOpponent(dt);
     stepBladePhysics(dt);
     updateCombat(dt);
+    updateDrillHud();
 
     if (Math.floor(match.time) !== Math.floor(match.time + dt)) updateHud();
   } else {

@@ -42,6 +42,23 @@
       pointer-events: none; z-index: 6;
     }
     #message.show { opacity: 1; }
+    #coach {
+      position: fixed; left: 50%; top: 18%; transform: translateX(-50%);
+      max-width: min(560px, 86vw); padding: 10px 16px; border-radius: 999px;
+      background: rgba(8,12,20,.78); border: 1px solid rgba(255,255,255,.13);
+      color: #dbe7ff; font-size: 14px; text-align: center; opacity: 0;
+      transition: opacity .18s, transform .18s; backdrop-filter: blur(10px); z-index: 7;
+      pointer-events: none;
+    }
+    #coach.show { opacity: 1; transform: translate(-50%, 6px); }
+    #drillHud {
+      position: fixed; top: 90px; right: 22px; width: 230px; padding: 14px 16px;
+      border-radius: 14px; background: rgba(8,12,20,.76); border: 1px solid rgba(255,255,255,.12);
+      color: #e8eaf0; z-index: 7; display: none; backdrop-filter: blur(10px);
+    }
+    #drillHud strong { display: block; font-size: 12px; letter-spacing: .12em; text-transform: uppercase; color: #7da6ff; }
+    #drillObjective { font-size: 13px; line-height: 1.4; margin-top: 6px; opacity: .82; }
+    #drillProgress { margin-top: 10px; font-size: 22px; font-weight: 750; }
 
     #bottombar {
       display: flex; justify-content: center; padding: 16px; gap: 8px;
@@ -54,7 +71,7 @@
       background: radial-gradient(ellipse at center, rgba(11,14,20,.82), rgba(11,14,20,.96));
       color: #e8eaf0;
     }
-    #panel { text-align: center; max-width: 560px; padding: 32px; }
+    #panel { text-align: center; width: min(760px, 94vw); padding: 32px; max-height: 94vh; overflow:auto; }
     #panel h1 { font-size: 34px; font-weight: 700; letter-spacing: .04em; margin-bottom: 6px; }
     #panel .sub { opacity: .7; margin-bottom: 26px; font-size: 15px; }
     .weaponRow { display: flex; gap: 10px; justify-content: center; margin-bottom: 26px; }
@@ -79,6 +96,33 @@
     }
     #inertiaRow input { accent-color: #2b6cff; margin-right: 6px; }
     #vrnote { margin-top: 14px; font-size: 12.5px; opacity: .5; }
+    .sectionLabel { margin: 18px 0 8px; font-size: 11px; letter-spacing: .16em; text-transform: uppercase; color:#8da8dc; }
+    .choiceRow { display:flex; flex-wrap:wrap; justify-content:center; gap:8px; }
+    .choice {
+      pointer-events:auto; cursor:pointer; border:1px solid rgba(255,255,255,.16); color:#dfe6f4;
+      background:rgba(255,255,255,.045); padding:10px 14px; border-radius:10px; font-size:13px;
+    }
+    .choice:hover { background:rgba(255,255,255,.1); }
+    .choice.sel { color:#fff; background:#285acb; border-color:#5684ee; box-shadow:0 0 0 2px rgba(71,119,230,.15); }
+    .modeDesc { min-height:38px; margin:10px auto 2px; max-width:600px; font-size:13px; line-height:1.45; color:#aeb9cc; }
+    .menuActions { display:flex; justify-content:center; gap:10px; margin-top:20px; }
+    .secondaryBtn { pointer-events:auto; cursor:pointer; padding:12px 18px; border-radius:10px; color:#dfe6f4; background:rgba(255,255,255,.07); border:1px solid rgba(255,255,255,.16); }
+    #report { display:none; text-align:left; }
+    #report h2 { text-align:center; margin-bottom:6px; }
+    .reportGrid { display:grid; grid-template-columns:repeat(3,1fr); gap:10px; margin:18px 0; }
+    .metric { background:rgba(255,255,255,.055); border:1px solid rgba(255,255,255,.1); border-radius:12px; padding:13px; }
+    .metric b { display:block; font-size:23px; color:#fff; }
+    .metric span { font-size:11px; text-transform:uppercase; letter-spacing:.08em; opacity:.62; }
+    #reportCoach { background:rgba(43,108,255,.12); border:1px solid rgba(76,127,246,.3); border-radius:12px; padding:14px; line-height:1.5; }
+    #historyLine { margin-top:12px; font-size:12px; opacity:.58; text-align:center; }
+    #pauseTitle { display:none; }
+    @media (max-width: 700px) {
+      #panel { padding:20px 14px; }
+      #panel h1 { font-size:27px; }
+      .reportGrid { grid-template-columns:repeat(2,1fr); }
+      #drillHud { right:10px; top:84px; width:190px; }
+      #bottombar { font-size:10px; }
+    }
   </style>
 </head>
 <body>
@@ -106,16 +150,45 @@
   </div>
 
   <div id="message"></div>
+  <div id="coach"></div>
+  <div id="drillHud"><strong id="drillName">Drill</strong><div id="drillObjective"></div><div id="drillProgress"></div></div>
 
   <div id="overlay">
     <div id="panel">
-      <h1>ÉPÉE SIMULATOR</h1>
-      <div class="sub">Olympic épée training · first to 15 · whole body is target</div>
-      <button id="startBtn">START BOUT</button>
+      <div id="menuMain">
+      <h1 id="menuTitle">ÉPÉE SIMULATOR</h1>
+      <h1 id="pauseTitle">PAUSED</h1>
+      <div class="sub" id="menuSub">Deliberate practice for distance, timing and point control</div>
+      <div class="sectionLabel">Training</div>
+      <div class="choiceRow" id="modeChoices">
+        <button class="choice sel" data-mode="bout">Full bout</button>
+        <button class="choice" data-mode="distance">Distance</button>
+        <button class="choice" data-mode="parry">Parry–riposte</button>
+        <button class="choice" data-mode="stop">Stop hit</button>
+        <button class="choice" data-mode="hand">Hand pick</button>
+        <button class="choice" data-mode="double">No doubles</button>
+      </div>
+      <div class="modeDesc" id="modeDesc">Fence a complete three-minute bout to 15.</div>
+      <div class="sectionLabel">Opponent</div>
+      <div class="choiceRow" id="styleChoices">
+        <button class="choice" data-style="beginner">Beginner</button>
+        <button class="choice" data-style="pressure">Pressure</button>
+        <button class="choice" data-style="counter">Counterattacker</button>
+        <button class="choice" data-style="blade">Blade heavy</button>
+        <button class="choice sel" data-style="adaptive">Adaptive</button>
+      </div>
       <label id="inertiaRow"><input type="checkbox" id="inertiaChk"/> Simulate blade weight (lag &amp; whip — leave off for clean point training)</label>
+      <div class="menuActions"><button id="resumeBtn" class="secondaryBtn" style="display:none">RESUME</button><button id="startBtn">START SESSION</button></div>
       <div id="controls">
         <b>Desktop test mode:</b> mouse steers your blade, click to thrust, Shift+click to lunge, W/S for footwork.<br/>
         <b>Quest:</b> open this page in the Quest browser and press "Enter VR". Right controller is your weapon; left stick advances/retreats; trigger marks your attack.
+      </div>
+      </div>
+      <div id="report">
+        <h2>SESSION REPORT</h2><div class="sub" id="reportResult"></div>
+        <div class="reportGrid" id="reportGrid"></div>
+        <div id="reportCoach"></div><div id="historyLine"></div>
+        <div class="menuActions"><button class="secondaryBtn" id="menuBtn">CHANGE TRAINING</button><button id="againBtn" class="secondaryBtn">TRAIN AGAIN</button></div>
       </div>
     </div>
   </div>
