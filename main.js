@@ -54,7 +54,11 @@ const CONFIG = {
     speed: 1.5,            // footwork speed m/s
     attackChance: 0.55,    // per second, when in distance
     parryChance: 0.72,     // chance to attempt a parry on an incoming thrust
-    reaction: 0.12,        // s to react to a fast blade (body reads take +0.1s)
+    reaction: 0.14,        // s to react to a fast blade (body reads take +0.1s)
+    pointWander: 0.05,     // living point: aim wander amplitude en garde (m)
+    armPickRange: [2.1, 2.65], // distance band for picks at the hand
+    // action repertoire base weights (habit-learning scales these live)
+    planWeights: { simple: 1, feint: 0.9, beat: 0.7, armPick: 0.9, trap: 0.5, second: 0.5 },
   },
 
   momentum: {
@@ -563,35 +567,68 @@ function buildOpponent() {
   o.add(backArm);
   parts.push({ node: backArm, zone: 'arm', radius: 0.1 });
 
-  const armPivot = new THREE.Group();
-  armPivot.position.set(0.16, 1.38, 0.1);
-  o.add(armPivot);
+  // neck
+  const neck = new THREE.Mesh(new THREE.CylinderGeometry(0.045, 0.055, 0.08, 10), jacket);
+  neck.position.set(0, 1.46, 0.02);
+  o.add(neck);
 
-  const upperArm = new THREE.Mesh(new THREE.CapsuleGeometry(0.05, 0.26, 4, 10), jacket);
-  upperArm.rotation.x = Math.PI / 2;
-  upperArm.position.z = 0.15;
-  upperArm.castShadow = true;
-  armPivot.add(upperArm);
+  // Weapon arm: shoulder→elbow→wrist chain, posed by two-bone IK each frame.
+  // Segments are direct children of the group; solveArm sets their transforms.
+  const upperArm = new THREE.Mesh(new THREE.CapsuleGeometry(0.05, 0.24, 4, 10), jacket);
+  const forearm = new THREE.Mesh(new THREE.CapsuleGeometry(0.044, 0.22, 4, 10), jacket);
+  upperArm.castShadow = true; forearm.castShadow = true;
+  o.add(upperArm); o.add(forearm);
   parts.push({ node: upperArm, zone: 'arm', radius: 0.1 });
-
-  const forearm = new THREE.Mesh(new THREE.CapsuleGeometry(0.045, 0.24, 4, 10), jacket);
-  forearm.rotation.x = Math.PI / 2;
-  forearm.position.z = 0.4;
-  forearm.castShadow = true;
-  armPivot.add(forearm);
   parts.push({ node: forearm, zone: 'arm', radius: 0.09 });
 
+  const hand = new THREE.Group();
+  o.add(hand);
+  const glove = new THREE.Mesh(new THREE.SphereGeometry(0.05, 12, 10), dark);
+  glove.position.z = 0.06;
+  hand.add(glove);
+  parts.push({ node: glove, zone: 'arm', radius: 0.08 });
+
   const sword = makeSword(0xb9bfca);
-  sword.position.set(0, 0, 0.55);
-  sword.rotation.y = Math.PI; // blade points +Z (toward player)
-  armPivot.add(sword);
+  hand.add(sword); // blade along hand -Z; the IK orients the hand
 
   scene.add(o);
 
-  return { group: o, parts, armPivot, sword, torso, head, legF, legB, backArm };
+  return { group: o, parts, sword, torso, head, legF, legB, backArm, upperArm, forearm, hand };
 }
 
 const opp = buildOpponent();
+
+/* --- two-bone arm IK (in the opponent group's local space) --- */
+
+const ARM_A = 0.34, ARM_B = 0.32; // upper arm, forearm lengths
+const _ikN = new THREE.Vector3(), _ikP = new THREE.Vector3(), _ikE = new THREE.Vector3();
+const _ikS = new THREE.Vector3(), _ikH = new THREE.Vector3(), _ikT = new THREE.Vector3();
+const _ikD = new THREE.Vector3(), _segDir = new THREE.Vector3();
+const _yUp = new THREE.Vector3(0, 1, 0), _negZ = new THREE.Vector3(0, 0, -1);
+
+function setSeg(mesh, from, to) {
+  mesh.position.copy(from).add(to).multiplyScalar(0.5);
+  _segDir.subVectors(to, from).normalize();
+  mesh.quaternion.setFromUnitVectors(_yUp, _segDir);
+}
+
+// positions upperArm/forearm between shoulder S and wrist H; returns clamped H
+function solveArm(S, H) {
+  _ikN.subVectors(H, S);
+  let d = _ikN.length();
+  d = THREE.MathUtils.clamp(d, 0.12, ARM_A + ARM_B - 0.015);
+  _ikN.normalize();
+  H.copy(S).addScaledVector(_ikN, d);
+  // elbow pole: out to the side and down, like a real weapon arm
+  _ikP.set(0.55, -0.8, -0.1);
+  _ikP.addScaledVector(_ikN, -_ikP.dot(_ikN)).normalize();
+  const cosA = (ARM_A * ARM_A + d * d - ARM_B * ARM_B) / (2 * ARM_A * d);
+  const sinA = Math.sqrt(Math.max(0, 1 - cosA * cosA));
+  _ikE.copy(S).addScaledVector(_ikN, ARM_A * cosA).addScaledVector(_ikP, ARM_A * sinA);
+  setSeg(opp.upperArm, S, _ikE);
+  setSeg(opp.forearm, _ikE, H);
+  return H;
+}
 
 /* ---------------- Player sword ---------------- */
 
@@ -616,6 +653,25 @@ const playerTarget = {
     }
   },
 };
+
+// Full épée target set on the player: hand and forearm (behind the guard,
+// along the weapon axis — in VR that IS your controller), mask, body.
+// Checked smallest-first so touches attribute to the right zone.
+const playerVols = [
+  { pos: new THREE.Vector3(), radius: 0.085, zone: 'hand' },
+  { pos: new THREE.Vector3(), radius: 0.09, zone: 'arm' },
+  { pos: new THREE.Vector3(), radius: 0.14, zone: 'mask' },
+  { pos: new THREE.Vector3(), radius: 0.3, zone: 'body' },
+];
+
+function updatePlayerVols() {
+  playerTarget.update();
+  playerVols[0].pos.copy(pBlade.root).addScaledVector(pBlade.dir, -0.1);
+  playerVols[1].pos.copy(pBlade.root).addScaledVector(pBlade.dir, -0.3);
+  if (renderer.xr.isPresenting) camera.getWorldPosition(playerVols[2].pos);
+  else playerVols[2].pos.set(rig.position.x, 1.62, rig.position.z);
+  playerVols[3].pos.copy(playerTarget.center);
+}
 
 /* ---------------- Audio ---------------- */
 
@@ -749,6 +805,10 @@ const ai = {
   prevDist: 2.05,
   stepPhase: 0,            // leg-cycle phase, advances with body speed
   lungeT: 0,               // 0 en-garde → 1 full lunge pose
+  plan: null,              // current tactical action {type, target, disengageDir, ...}
+  memory: { parryL: 0, parryR: 0, playerAdvances: 0 }, // reads of YOUR habits
+  advCool: 0,
+  guardBias: { x: 0, y: 0, tx: 0, ty: 0, t: 0 },       // slow line changes / invitations
   attacking: false,
   parryMsg: false,         // 'Parried!' shown for this parry
   beatMsg: false,          // 'Deflected!' shown for this attack
@@ -761,6 +821,34 @@ function aiSetState(s) {
   ai.stateTime = 0;
   if (s === 'parry') ai.parryMsg = false;
   if (s === 'lunge' || s === 'riposte') ai.beatMsg = false;
+}
+
+// pick the next action from the repertoire, weighted by what YOU have shown
+function choosePlan(dist) {
+  const C = CONFIG.opponent, mem = ai.memory;
+  const w = { ...C.planWeights };
+  const parries = mem.parryL + mem.parryR;
+  w.feint *= 1 + Math.min(2, parries * 0.25);      // you parry a lot → he feints
+  w.second *= 1 + Math.min(2, parries * 0.2);      // ...and sets traps for your riposte
+  w.beat *= 1 + Math.min(1.5, mem.playerAdvances * 0.1);
+  w.trap *= 1 + Math.min(2, mem.playerAdvances * 0.15); // you rush in → he baits it
+  if (dist < C.armPickRange[0] || dist > C.armPickRange[1]) w.armPick = 0;
+
+  let sum = 0;
+  for (const k in w) sum += w[k];
+  let r = Math.random() * sum, type = 'simple';
+  for (const k in w) { r -= w[k]; if (r <= 0) { type = k; break; } }
+
+  // disengage around the side you habitually parry toward
+  const disengageDir = mem.parryR > mem.parryL ? -1 : mem.parryL > mem.parryR ? 1
+    : (Math.random() < 0.5 ? 1 : -1);
+  ai.plan = {
+    type, disengageDir,
+    target: type === 'armPick' ? 'hand' : (Math.random() < 0.15 ? 'mask' : 'body'),
+  };
+  if (type === 'trap') { ai.plan.window = 0.9; aiSetState('retreat'); }
+  else if (type === 'beat') aiSetState('beat');
+  else aiSetState('lunge');
 }
 
 function updateOpponent(dt) {
@@ -776,17 +864,23 @@ function updateOpponent(dt) {
   // stepping rhythm — humans move in pulses, not glides
   const cadence = 0.55 + 0.45 * Math.sin(ai.bob * Math.PI * 2 * M.cadence);
 
+  // how fast is the player closing? (he reads your footwork, with some latency)
+  const closing = dt > 0 ? (ai.prevDist - dist) / dt : 0;
+  ai.prevDist = dist;
+  ai.advCool -= dt;
+  if (closing > 1.3 && ai.advCool <= 0) { ai.advCool = 1; ai.memory.playerAdvances++; }
+
   let desired = 0;
   let accel = M.maxAccel;
   let inTell = false;
 
   switch (ai.state) {
     case 'engarde': {
-      ai.extTarget = 0.15;
+      ai.extTarget = 0.16 + 0.09 * Math.sin(ai.bob * 0.8); // probing extensions
       ai.attacking = false;
       if (dist > C.preferredDist + 0.25) aiSetState('advance');
       else if (dist < C.preferredDist - 0.35) aiSetState('retreat');
-      else if (match.phase === 'fencing' && Math.random() < C.attackChance * dt) aiSetState('lunge');
+      else if (match.phase === 'fencing' && Math.random() < C.attackChance * dt) choosePlan(dist);
       break;
     }
     case 'advance': {
@@ -797,22 +891,53 @@ function updateOpponent(dt) {
     }
     case 'retreat': {
       desired = -C.speed * 1.15 * cadence * sign;
-      if (dist >= C.preferredDist || o.position.z < -6.5) aiSetState('engarde');
+      if (ai.plan?.type === 'trap') {
+        // false retreat: invite the advance, counter into it
+        ai.plan.window -= dt;
+        if (closing > 0.9 && dist < 2.6 && dist > 1.5) {
+          ai.plan = { type: 'counter', target: Math.random() < 0.6 ? 'hand' : 'body' };
+          aiSetState('lunge');
+        } else if (ai.plan.window <= 0) {
+          ai.plan = null;
+          aiSetState('engarde');
+        }
+      } else if (dist >= C.preferredDist || o.position.z < -6.5) aiSetState('engarde');
+      break;
+    }
+    case 'beat': {
+      // sharp blade take before the attack
+      ai.extTarget = 0.75;
+      desired = 0.4 * sign;
+      if (ai.stateTime > 0.16) {
+        if (ai.plan) ai.plan.skipTell = true; // the beat WAS the preparation
+        aiSetState('lunge');
+      }
       break;
     }
     case 'lunge': {
-      if (ai.stateTime < M.tellTime) {
+      const plan = ai.plan || { type: 'simple' };
+      const tell = plan.skipTell ? 0 : plan.type === 'counter' ? 0.06
+        : plan.type === 'armPick' ? 0.1 : M.tellTime;
+      const drive = plan.type === 'armPick' ? 0.24 : plan.type === 'second' ? 0.3
+        : plan.type === 'feint' ? 0.5 : M.driveTime;
+      if (ai.stateTime < tell) {
         // preparation — readable if you watch for it
         inTell = true;
         ai.extTarget = 0.55;
-      } else if (ai.stateTime < M.tellTime + M.driveTime) {
+      } else if (ai.stateTime < tell + drive) {
         // committed, ballistic drive — cannot abort
         ai.extTarget = 1;
-        desired = M.lungeSpeed * sign;
+        desired = M.lungeSpeed * (plan.type === 'armPick' ? 0.55 : 1) * sign;
         accel = M.lungeAccel;
         if (!ai.attacking) {
           ai.attacking = true;
           if (!match.priority) match.priority = 'opponent';
+        }
+        // second intention: the shallow attack drew your parry — counter-time
+        if (plan.type === 'second' && oBlade.deflection() > 0.3) {
+          ai.parryTimer = 0.3;
+          ai.parryDir = pBlade.tipNow.x > o.position.x ? 1 : -1;
+          aiSetState('parry');
         }
       } else {
         aiSetState('recover');
@@ -839,7 +964,13 @@ function updateOpponent(dt) {
       ai.attacking = false;
       ai.extTarget = 0.2;
       desired = dist < C.preferredDist - 0.15 ? -C.speed * 1.2 * sign : 0;
-      if (ai.stateTime > 0.45 && Math.abs(ai.vel) < 0.25) {
+      // remise: the attack was deflected but no riposte is coming — renew it
+      if (ai.beatMsg && !ai.plan && ai.stateTime > 0.08 && ai.stateTime < 0.2 &&
+          pTipVel.z > -0.5 && Math.random() < 3 * dt) {
+        ai.plan = { type: 'counter', target: 'body' };
+        aiSetState('riposte');
+      } else if (ai.stateTime > 0.45 && Math.abs(ai.vel) < 0.25) {
+        ai.plan = null;
         aiSetState(dist < C.preferredDist - 0.3 ? 'retreat' : 'engarde');
       }
       break;
@@ -850,6 +981,13 @@ function updateOpponent(dt) {
       if (ai.parryTimer <= 0) aiSetState('riposte');
       break;
     }
+  }
+
+  // attack on preparation: rushing into distance gets counterattacked (often to the arm)
+  if ((ai.state === 'engarde' || ai.state === 'advance') && match.phase === 'fencing' &&
+      closing > 1.3 && dist < 2.3 && dist > 1.4 && Math.random() < 2.5 * dt) {
+    ai.plan = { type: 'counter', target: 'hand' };
+    aiSetState('lunge');
   }
 
   // --- momentum: acceleration-limited body velocity ---
@@ -864,9 +1002,7 @@ function updateOpponent(dt) {
   // --- parry reaction (blocked while committed to a drive) ---
   // they react to a fast blade OR to the body suddenly closing distance —
   // a slow creep doesn't read as an attack, a rushed advance draws the parry
-  const closing = dt > 0 ? (ai.prevDist - dist) / dt : 0;
-  ai.prevDist = dist;
-  const committed = (ai.state === 'lunge' && ai.stateTime >= M.tellTime) ||
+  const committed = (ai.state === 'lunge' && ai.attacking) || ai.state === 'beat' ||
                     ai.state === 'riposte' || ai.state === 'parry' || ai.state === 'recover';
   if (!committed && match.phase === 'fencing') {
     const tipToTorso = pBlade.tipNow.distanceTo(_t1.setFromMatrixPosition(opp.torso.matrixWorld));
@@ -923,49 +1059,90 @@ function updateOpponent(dt) {
   const faceDir = sign;
   o.rotation.y = faceDir > 0 ? 0 : Math.PI;
 
-  // weapon arm: aim at the player's chest; during a parry, drive at the player's blade
-  const arm = opp.armPivot;
-  const target = _t2.set(playerTarget.center.x, playerTarget.center.y + 0.15, playerTarget.center.z);
+  // --- aim resolution: what is the point doing right now? ---
+  updatePlayerVols();
+  const target = _t2;
   if (ai.state === 'parry') {
     // opposition: aim through the player's blade, gliding from their foible
     // toward their forte — the rods stay crossed so the press never breaks
     const slide = THREE.MathUtils.lerp(0.6, 0.2, THREE.MathUtils.clamp(ai.stateTime / 0.3, 0, 1));
-    _t3.copy(pBlade.root).addScaledVector(pBlade.dir, slide * pBlade.len);
-    target.copy(_t3);
-    // follow-offset: always press a little past wherever the blade is now,
-    // so the carry is sustained as the blade gives ground
+    target.copy(pBlade.root).addScaledVector(pBlade.dir, slide * pBlade.len);
     target.x += ai.parryDir * PH.parryPress;
+  } else if (ai.state === 'beat') {
+    target.copy(pBlade.root).addScaledVector(pBlade.dir, 0.55 * pBlade.len);
+  } else {
+    const tName = ai.plan ? ai.plan.target : 'body';
+    if (tName === 'hand') target.copy(playerVols[0].pos);
+    else if (tName === 'mask') target.copy(playerVols[2].pos);
+    else target.set(playerTarget.center.x, playerTarget.center.y + 0.15, playerTarget.center.z);
+
+    // feint: show one line, then disengage around the parry into another
+    if (ai.plan?.type === 'feint' && ai.attacking) {
+      const dT = ai.stateTime - M.tellTime;
+      if (dT > 0.14 && dT < 0.3) {
+        const s = Math.sin(((dT - 0.14) / 0.16) * Math.PI);
+        target.x += ai.plan.disengageDir * 0.3 * s;
+        target.y -= 0.08 * s;
+      }
+    }
+
+    // living point: the tip is never still on guard
+    if (!ai.attacking) {
+      const t = ai.bob;
+      target.x += (Math.sin(t * 1.9) + 0.5 * Math.sin(t * 3.7 + 1.3)) * C.pointWander;
+      target.y += (Math.sin(t * 2.6 + 0.7) + 0.4 * Math.sin(t * 4.3)) * C.pointWander * 0.8;
+    }
   }
 
-  // once the drive is committed the arm is ballistic — no mid-lunge re-aiming.
-  // this is what makes beats, deflections and dodges pay off.
-  if (ai.attacking && (ai.state === 'lunge' || ai.state === 'riposte')) {
+  // committed drives can't re-aim — but a feint commits late: the disengage IS the re-aim
+  const freezeReady = !(ai.plan?.type === 'feint' && ai.stateTime < M.tellTime + 0.3);
+  if (ai.attacking && (ai.state === 'lunge' || ai.state === 'riposte') && freezeReady) {
     if (!ai.aimFrozen) { ai.aimFrozen = true; ai.frozenAim.copy(target); }
     target.copy(ai.frozenAim);
-  } else {
+  } else if (!ai.attacking) {
     ai.aimFrozen = false;
   }
-  arm.updateMatrixWorld();
-  const armPos = _t3.setFromMatrixPosition(arm.matrixWorld);
-  const aim = _t1.subVectors(target, armPos).normalize();
 
-  const relaxedPitch = -0.25, relaxedYaw = faceDir > 0 ? 0.15 : Math.PI - 0.15;
-  const aimYaw = Math.atan2(aim.x, aim.z);
-  const aimPitch = -Math.asin(THREE.MathUtils.clamp(aim.y, -1, 1)) + 0.02;
-  const localYaw = faceDir > 0 ? aimYaw : aimYaw - Math.PI;
+  // --- pose the arm chain: two-bone IK toward the aim, wrist steers the point ---
+  _ikT.copy(target).sub(o.position);
+  _ikT.x *= faceDir; _ikT.z *= faceDir; // world → group-local (yaw is 0 or π)
+  const S = _ikS.set(0.17, 1.4, 0.12 + L * 0.22 + ai.vel * faceDir * 0.02);
+  _ikD.subVectors(_ikT, S).normalize();
+  const reach = 0.34 + ai.ext * 0.34;
+  const H = _ikH.copy(S).addScaledVector(_ikD, reach);
+  H.y -= 0.02;
 
-  // a parry aims the blade precisely regardless of arm extension
-  const aimBlend = ai.state === 'parry' ? 1 : ai.ext;
-  const yaw = THREE.MathUtils.lerp(relaxedYaw - (faceDir > 0 ? 0 : Math.PI), localYaw, aimBlend);
-  const pitch = THREE.MathUtils.lerp(relaxedPitch, aimPitch, aimBlend);
+  // slow guard shifts — invitations and line changes between actions
+  const gb = ai.guardBias;
+  gb.t -= dt;
+  if (gb.t <= 0) {
+    gb.t = 2 + Math.random() * 2.5;
+    gb.tx = (Math.random() - 0.5) * 0.14;
+    gb.ty = (Math.random() - 0.5) * 0.1;
+  }
+  gb.x = THREE.MathUtils.damp(gb.x, gb.tx, 1.5, dt);
+  gb.y = THREE.MathUtils.damp(gb.y, gb.ty, 1.5, dt);
+  H.x += gb.x * (1 - ai.ext);
+  H.y += gb.y * (1 - ai.ext);
 
-  arm.rotation.set(pitch, yaw, 0);
-  opp.sword.position.z = 0.55 + ai.ext * 0.25;
+  solveArm(S, H);
+  opp.hand.position.copy(H);
+  _ikD.subVectors(_ikT, H).normalize();
+  opp.hand.quaternion.setFromUnitVectors(_negZ, _ikD);
+
+  // head tracks the player
+  _t1.copy(playerVols[2].pos).sub(o.position);
+  _t1.x *= faceDir; _t1.z *= faceDir;
+  _t1.sub(opp.head.position);
+  const hYaw = THREE.MathUtils.clamp(Math.atan2(_t1.x, _t1.z), -0.7, 0.7);
+  const hPitch = THREE.MathUtils.clamp(-Math.atan2(_t1.y, Math.hypot(_t1.x, _t1.z)), -0.35, 0.45);
+  opp.head.rotation.set(hPitch, hYaw, 0);
 
   // grip strength by intent
-  oBlade.stiffness = ai.state === 'parry' ? PH.oppParryK : (ai.attacking ? PH.oppAttackK : PH.oppGuardK);
+  oBlade.stiffness = (ai.state === 'parry' || ai.state === 'beat') ? PH.oppParryK
+    : (ai.attacking ? PH.oppAttackK : PH.oppGuardK);
   oBlade.damping = 1.7 * Math.sqrt(oBlade.stiffness);
-  oBlade.yield = ai.state === 'parry' ? PH.parryYield : 1;
+  oBlade.yield = ai.state === 'parry' ? PH.parryYield : (ai.state === 'beat' ? 0.55 : 1);
 }
 
 /* ---------------- Blade physics step + contact feedback ---------------- */
@@ -1048,41 +1225,47 @@ function stepBladePhysics(dt) {
       ai.beatMsg = true;
       match.priority = 'player';
       showMessage('Deflected!', 0.7);
+      // learn which side you habitually defend toward
+      if (pBlade.tipNow.x > playerTarget.center.x) ai.memory.parryR++;
+      else ai.memory.parryL++;
     }
   }
 }
 
 /* ---------------- Combat resolution ---------------- */
 
-function registerTouch(side) {
+function registerTouch(side, zone = '') {
   if (match.phase !== 'fencing' && !match.lock) return;
   if (!match.lock) {
-    match.lock = { timer: CONFIG.lockout, touches: {} };
+    match.lock = { timer: CONFIG.lockout, touches: {}, zones: {} };
     match.phase = 'lockout';
   }
   if (match.lock.touches[side]) return;
   match.lock.touches[side] = true;
+  match.lock.zones[side] = zone;
   audio.buzzer(side === 'player' ? 520 : 440, 0.5);
   pulseHaptic(0.9, 120);
 }
 
 function resolveLock() {
   const t = match.lock.touches;
+  const zones = match.lock.zones;
   match.lock = null;
 
   const pOn = !!t.player, oOn = !!t.opponent;
   setLights({ player: pOn, opp: oOn });
 
+  const zoneTag = (z) => (z && z !== 'body' && z !== 'torso') ? ` — ${z}!` : '!';
   let msg = '';
   if (pOn && oOn) {
     match.scorePlayer++; match.scoreOpp++;
     msg = 'Double touch!';
   } else if (pOn) {
     match.scorePlayer++;
-    msg = 'Touch!';
+    msg = 'Touch' + zoneTag(zones.player);
   } else if (oOn) {
     match.scoreOpp++;
-    msg = 'Touch against';
+    msg = 'Touch against' + zoneTag(zones.opponent);
   }
 
   showMessage(msg, CONFIG.resetPause);
@@ -1107,6 +1290,7 @@ function resetPhrase() {
   ai.vel = 0;
   ai.ext = 0.15;
   ai.reactTimer = 0; ai.attacking = false;
+  ai.plan = null; ai.aimFrozen = false;
   aiSetState('engarde');
   if (!renderer.xr.isPresenting) rig.position.z = 2;
   else {
@@ -1146,7 +1330,7 @@ function updateCombat(dt) {
           _t3.subVectors(c, pBlade.tipNow).normalize();
           if (pBlade.dir.dot(_t3) < CONFIG.touch.pointFirst) break;
           if (W.target.includes(part.zone)) {
-            registerTouch('player');
+            registerTouch('player', part.zone);
             // blade bows on the touch
             _flexKick.copy(pTipVel).addScaledVector(pBlade.dir, -axial);
             if (_flexKick.lengthSq() < 1e-4) _flexKick.set(0, 1, 0);
@@ -1159,20 +1343,26 @@ function updateCombat(dt) {
     }
   }
 
-  // ---- opponent scoring: same force model against the player capsule ----
-  playerTarget.update();
+  // ---- opponent scoring: same force model against the full player target set ----
   const oSpeed = oTipVel.length();
   if (ai.attacking && oSpeed > 1e-3) {
     const axialO = oTipVel.dot(oBlade.dir);
     const alignO = axialO / oSpeed;
-    _t3.subVectors(playerTarget.center, oBlade.tipNow).normalize();
-    if (axialO > CONFIG.touch.axialSpeed * 0.8 && alignO > CONFIG.touch.alignment &&
-        oBlade.dir.dot(_t3) > CONFIG.touch.pointFirst &&
-        pointSegmentDistance(playerTarget.center, oBlade.tipPrev, oBlade.tipNow) < playerTarget.radius + 0.12) {
-      registerTouch('opponent');
-      _t2.crossVectors(oBlade.dir, _t1.set(0, 1, 0));
-      if (_t2.lengthSq() > 1e-6) oBlade.kickFlex(Math.min(3, axialO * 0.8), _t2.normalize());
-      aiSetState('recover');
+    if (axialO > CONFIG.touch.axialSpeed * 0.8 && alignO > CONFIG.touch.alignment) {
+      updatePlayerVols();
+      for (const v of playerVols) {
+        if (pointSegmentDistance(v.pos, oBlade.tipPrev, oBlade.tipNow) >= v.radius) continue;
+        // the bell guard blocks shots coming straight down the weapon line —
+        // hand touches need angulation (or your blade wandering off line)
+        if (v.zone === 'hand' && oBlade.dir.dot(pBlade.dir) < -0.85) continue;
+        _t3.subVectors(v.pos, oBlade.tipNow).normalize();
+        if (oBlade.dir.dot(_t3) < CONFIG.touch.pointFirst) break;
+        registerTouch('opponent', v.zone);
+        _t2.crossVectors(oBlade.dir, _t1.set(0, 1, 0));
+        if (_t2.lengthSq() > 1e-6) oBlade.kickFlex(Math.min(3, axialO * 0.8), _t2.normalize());
+        aiSetState('recover');
+        break;
+      }
     }
   }
 
@@ -1349,6 +1539,7 @@ document.getElementById('startBtn').addEventListener('click', () => {
   match.scorePlayer = 0;
   match.scoreOpp = 0;
   match.time = CONFIG.boutTime;
+  ai.memory.parryL = 0; ai.memory.parryR = 0; ai.memory.playerAdvances = 0;
   updateHud();
   resetPhrase();
   if (!renderer.xr.isPresenting) renderer.domElement.requestPointerLock();
@@ -1360,7 +1551,7 @@ const clock = new THREE.Clock();
 updateHud();
 
 // Debug/test hook (harmless in production; lets automated tests drive the sim)
-window.SIM = { match, desktop, rig, opp, ai, CONFIG, WEAPONS, playerSword, pBlade, oBlade, applyInertiaSetting };
+window.SIM = { match, desktop, rig, opp, ai, CONFIG, WEAPONS, playerSword, pBlade, oBlade, applyInertiaSetting, aiSetState, choosePlan, playerVols };
 
 function step(dt) {
   window.__testTick?.(dt);
