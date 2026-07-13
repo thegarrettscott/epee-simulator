@@ -82,13 +82,27 @@ const WEAPONS = {
 const weaponKey = 'epee';
 
 const TRAINING_MODES = {
-  bout: { label: 'Full bout', time: 180, score: 15, objective: 'Fence a complete three-minute bout to 15.' },
-  distance: { label: 'Distance control', time: 60, score: 999, objective: 'Stay at effective measure (1.85–2.35 m) without being hit.' },
-  parry: { label: 'Parry–riposte', time: 75, score: 8, objective: 'Deflect the committed attack, then land the riposte.' },
-  stop: { label: 'Stop hit', time: 75, score: 8, objective: 'Hit during the opponent’s preparation or committed drive.' },
-  hand: { label: 'Hand pick', time: 75, score: 10, objective: 'Control the point and score specifically on the weapon arm or hand.' },
-  double: { label: 'No doubles', time: 90, score: 10, objective: 'Score cleanly. Every double touch counts against the drill.' },
-  target: { label: 'Target drill', time: 90, score: 999, objective: 'Hit the lit target point-first before it fades. Recover to guard between touches.' },
+  bout: { label: 'Full bout', time: 180, score: 15,
+    objective: 'Fence a complete three-minute bout to 15.',
+    howTo: 'Fence in phrases: find the distance, make ONE clear action, recover. Watch his small crouch — it telegraphs the lunge.' },
+  distance: { label: 'Distance control', time: 60, score: 999,
+    objective: 'Stay at effective measure (1.85–2.35 m) without being hit.',
+    howTo: 'Mirror his footwork with small steps. You are safe just outside his lunge (~2.1 m). Step in only when you intend to threaten.' },
+  parry: { label: 'Parry–riposte', time: 75, score: 8,
+    objective: 'Deflect the committed attack, then land the riposte.',
+    howTo: 'Wait in guard. When the lunge comes, move your bell ACROSS to meet his blade — a small wrist motion — then extend straight to his chest.' },
+  stop: { label: 'Stop hit', time: 75, score: 8,
+    objective: 'Hit during the opponent’s preparation or committed drive.',
+    howTo: 'Watch for the crouch and the withdrawing hand. The instant he prepares, extend to his hand or arm and step back out of reach.' },
+  hand: { label: 'Hand pick', time: 75, score: 10,
+    objective: 'Control the point and score specifically on the weapon arm or hand.',
+    howTo: 'Keep your point just under his bell, small circles. Attack the hand only when his point drifts off line — never straight into his guard.' },
+  double: { label: 'No doubles', time: 90, score: 10,
+    objective: 'Score cleanly. Every double touch counts against the drill.',
+    howTo: 'Never attack straight into his point. Close his line with your blade or beat it aside first — then the only tip that arrives is yours.' },
+  target: { label: 'Target drill', time: 90, score: 999,
+    objective: 'Hit the lit target point-first before it fades. Recover to guard between touches.',
+    howTo: 'Extend the arm FIRST — the point leads, the legs follow. Fix your point on the light, push through it, then come fully back to guard.' },
 };
 
 const OPPONENT_STYLES = {
@@ -1579,6 +1593,10 @@ const drill = {
   reactions: [],
   lastMs: 0,
   flash: 0,
+  // per-rep technique diagnosis — teach the reason, not just the result
+  rep: { closest: 9, slap: false, weak: false, early: false },
+  prevCenterZ: 0,
+  holdT: 0, holdCue: false,
 };
 
 // weighted toward hand/forearm — épée bread and butter
@@ -1620,13 +1638,32 @@ function drillResult(hit, msg) {
     }
     audio.buzzer(1500, 0.1, 'sine', 0.2);
     audio.buzzer(2000, 0.14, 'sine', 0.12);
-    showMessage(`${drill.lastMs} ms`, 0.9);
+    const ms = drill.lastMs;
+    showMessage(ms < 400 ? `${ms} ms — sharp!` : ms < 650 ? `${ms} ms` : `${ms} ms — start sooner`, 0.9);
+    if (drill.rep.early) coach('Touch! Next time let the point lead — extend the arm before the legs drive.');
+    else if (drill.streak > 0 && drill.streak % 5 === 0) coach(`Streak ${drill.streak} — the window is shrinking. Same calm action.`);
     pulseHaptic(0.7, 60);
   } else {
     drill.misses++; drill.streak = 0;
     match.scoreOpp++;
     if (session) session.attacks++;
     audio.buzzer(170, 0.25, 'square', 0.14);
+    // diagnose WHY it missed
+    if (drill.rep.slap) {
+      msg = 'Point first!';
+      coach('The blade swung across the light. Fix the point on it and push straight through.');
+    } else if (drill.rep.weak) {
+      msg = 'Push through';
+      coach('You reached the light without pressure. Commit the extension — drive the point in.');
+    } else if (msg === 'Too slow' && drill.rep.closest < 0.12) {
+      coach('Millimetres away — same action, just extend fully.');
+    } else if (msg === 'Too slow' && drill.rep.early) {
+      coach('The legs went before the point. Extend the arm first — it is faster AND safer.');
+    } else if (msg === 'Too slow') {
+      coach('Start extending the instant the light appears — point before legs.');
+    } else if (msg === 'Wrong spot') {
+      coach('Accuracy before speed. Look at the light, fix your point on it, then extend.');
+    }
     showMessage(msg, 0.9);
   }
   drill.phase = 'return';
@@ -1642,6 +1679,8 @@ function updateDrill(dt) {
 
   playerTarget.update();
   const tipOut = Math.abs(playerTarget.center.z - pBlade.tipNow.z);
+  const closing = dt > 0 ? (drill.prevCenterZ - playerTarget.center.z) / dt : 0;
+  drill.prevCenterZ = playerTarget.center.z;
 
   switch (drill.phase) {
     case 'return': { // no camping extended — recover to guard between reps
@@ -1650,9 +1689,17 @@ function updateDrill(dt) {
         if (drill.t > 0.2) {
           drill.phase = 'wait';
           drill.t = 0;
-          drill.delay = 0.6 + Math.random() * 1.8;
+          drill.holdT = 0; drill.holdCue = false;
         }
-      } else drill.t = 0;
+      } else {
+        drill.t = 0;
+        drill.holdT += dt;
+        if (drill.holdT > 1.3 && !drill.holdCue) {
+          drill.holdCue = true;
+          coach('Recover to guard — bring the arm all the way back. The next light waits for you.');
+        }
+      }
+      if (drill.phase === 'wait') drill.delay = 0.6 + Math.random() * 1.8;
       break;
     }
     case 'wait': {
@@ -1662,6 +1709,8 @@ function updateDrill(dt) {
         drill.window = Math.max(0.85, 1.7 - drill.streak * 0.06);
         drill.phase = 'live';
         drill.t = 0;
+        drill.rep.closest = 9;
+        drill.rep.slap = false; drill.rep.weak = false; drill.rep.early = false;
         drillMesh.visible = true;
         audio.buzzer(880, 0.09, 'sine', 0.18);
       }
@@ -1669,6 +1718,8 @@ function updateDrill(dt) {
     }
     case 'live': {
       drill.t += dt;
+      // point-before-legs: launching the body while the arm is still home
+      if (closing > 0.8 && tipOut < 1.4) drill.rep.early = true;
       if (drill.t > drill.window) drillResult(false, 'Too slow');
       break;
     }
@@ -1688,20 +1739,33 @@ function drillCombat() {
   if (pSpeed < 1e-3) return;
   const axial = pTipVel.dot(pBlade.dir);
   const alignment = axial / pSpeed;
-  if (axial < CONFIG.touch.axialSpeed || alignment < CONFIG.touch.alignment) return;
+  const gatesPass = axial >= CONFIG.touch.axialSpeed && alignment >= CONFIG.touch.alignment;
 
   drill.spot.node().getWorldPosition(drill.targetPos);
-  if (pointSegmentDistance(drill.targetPos, pBlade.tipPrev, pBlade.tipNow) < drill.spot.r + 0.02) {
+  const d = pointSegmentDistance(drill.targetPos, pBlade.tipPrev, pBlade.tipNow);
+  drill.rep.closest = Math.min(drill.rep.closest, d);
+
+  if (d < drill.spot.r + 0.02) {
     _t3.subVectors(drill.targetPos, pBlade.tipNow).normalize();
-    if (pBlade.dir.dot(_t3) >= CONFIG.touch.pointFirst - 0.1) {
+    const pointFirst = pBlade.dir.dot(_t3) >= CONFIG.touch.pointFirst - 0.1;
+    if (gatesPass && pointFirst) {
       drillResult(true);
       return;
     }
+    // the tip reached the light but the touch would not count — remember why
+    if (pSpeed > 0.6) {
+      if (alignment < CONFIG.touch.alignment || !pointFirst) drill.rep.slap = true;
+      else if (axial < CONFIG.touch.axialSpeed) drill.rep.weak = true;
+    }
+    return;
   }
-  // a clean touch anywhere else = wrong spot
+  if (!gatesPass) return;
+  // a clean touch on some OTHER body part = wrong spot; the limb hosting
+  // the light is exempt so a near-miss keeps flying toward the bull's-eye
   for (const part of opp.parts) {
     const c = _t1.setFromMatrixPosition(part.node.matrixWorld);
     if (pointSegmentDistance(c, pBlade.tipPrev, pBlade.tipNow) < part.radius) {
+      if (c.distanceTo(drill.targetPos) < part.radius + 0.06) continue; // target's own limb
       _t3.subVectors(c, pBlade.tipNow).normalize();
       if (pBlade.dir.dot(_t3) >= CONFIG.touch.pointFirst) drillResult(false, 'Wrong spot');
       return;
@@ -1942,13 +2006,18 @@ if (inertiaChk) {
   });
 }
 
+function setModeDesc() {
+  const m = TRAINING_MODES[match.mode];
+  document.getElementById('modeDesc').innerHTML = `${m.objective}<br><span class="howTo">${m.howTo}</span>`;
+}
+
 function selectChoice(groupId, key, attr) {
   document.querySelectorAll(`#${groupId} .choice`).forEach((b) => b.classList.toggle('sel', b.dataset[attr] === key));
 }
 
 document.querySelectorAll('#modeChoices .choice').forEach((btn) => btn.addEventListener('click', () => {
   match.mode = btn.dataset.mode; selectChoice('modeChoices', match.mode, 'mode');
-  document.getElementById('modeDesc').textContent = TRAINING_MODES[match.mode].objective;
+  setModeDesc();
 }));
 document.querySelectorAll('#styleChoices .choice').forEach((btn) => btn.addEventListener('click', () => {
   match.style = btn.dataset.style; selectChoice('styleChoices', match.style, 'style');
@@ -1960,7 +2029,7 @@ try {
   if (OPPONENT_STYLES[prefs.style]) match.style = prefs.style;
   if (typeof prefs.inertia === 'boolean') { CONFIG.bladeInertia = prefs.inertia; inertiaChk.checked = prefs.inertia; applyInertiaSetting(); }
   selectChoice('modeChoices', match.mode, 'mode'); selectChoice('styleChoices', match.style, 'style');
-  document.getElementById('modeDesc').textContent = TRAINING_MODES[match.mode].objective;
+  setModeDesc();
 } catch (_) {}
 
 function openMainMenu() {
@@ -1990,6 +2059,10 @@ function startSession() {
   drillMesh.visible = false;
   updateHud(); updateDrillHud(); resetPhrase();
   coach(mode.objective, 3.4);
+  const startedMode = match.mode;
+  setTimeout(() => {
+    if (match.started && !match.paused && match.mode === startedMode) coach(TRAINING_MODES[startedMode].howTo, 5.5);
+  }, 4200);
   if (!renderer.xr.isPresenting) renderer.domElement.requestPointerLock();
 }
 
@@ -2022,6 +2095,18 @@ function step(dt) {
         session.totalFencingTime += dt;
         const dist = Math.abs(opp.group.position.z - playerTarget.center.z);
         if (dist >= 1.85 && dist <= 2.35) session.measureTime += dt;
+        // live distance coaching — say it while it can still be fixed
+        if (match.mode === 'distance') {
+          if (dist >= 1.85 && dist <= 2.35) session.outT = 0;
+          else {
+            session.outT = (session.outT || 0) + dt;
+            if (session.outT > 3) {
+              session.outT = -7; // cooldown before repeating the cue
+              coach(dist < 1.85 ? 'Too close — no time to react here. Step back out.'
+                : 'Too far to threaten. Small steps in until your lunge can reach.');
+            }
+          }
+        }
       }
       if (match.time === 0 && match.phase === 'fencing') {
         if (match.mode === 'bout' && match.scorePlayer === match.scoreOpp && !match.overtime) {
