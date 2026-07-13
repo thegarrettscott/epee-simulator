@@ -9,7 +9,8 @@ A VR épée trainer for Meta Quest that runs in the Quest browser — no app ins
 - **Fencing-true timing**: a surprise attack in tempo from critical distance beats the reaction parry; a telegraphed advance-lunge gets read and parried. The AI reacts faster to blade threats than to footwork.
 - **Opponent momentum**: acceleration-limited footwork with stepping cadence, a readable preparation tell before each lunge, and ballistic committed drives — no mid-lunge re-aiming, so beats and dodges genuinely break attacks.
 - **Épée touch model**: the swept tip must arrive point-first with axial drive (the 750g force proxy) — slaps, whips and grazes don't score. Whole body is target; double touches score for both.
-- Contact feedback: clash sound pitched by position on the blade (tip rings higher), scrape sounds for sliding blades, haptics scaled by impact
+- **Constant blade conversation**: the opponent seeks light engagement of your blade by default (with changes of engagement under your point) and a resting engagement yields when pushed; steel can never pass through steel, but disengages around the point are legal. You hear and feel the blade continuously — soft slither for engagement, scrapes for glides, clashes pitched by position on the blade, haptics scaled by impact.
+- **Target drill mode**: a lit target appears somewhere on the opponent (weighted toward hand and forearm) after a random delay — hit it point-first before the window closes, recover to guard between reps. Tracks reaction time, accuracy and streak; the window shrinks as you streak.
 - Optional **blade weight simulation** (menu toggle): grip spring softens so the blade lags and whips like a real épée — off by default for clean point training
 - Scoreboard, scoring lights, 3-minute clock, bout to 15
 

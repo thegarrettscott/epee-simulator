@@ -31,10 +31,12 @@ const CONFIG = {
 
   physics: {
     substeps: 6,
-    contactRadius: 0.028,  // blade-to-blade contact distance (with flex contact patch)
-    pressOvershoot: 2.2,   // separation factor under an active press — the carry ratchet
-    idleOvershoot: 1.2,    // gentle ratchet for incidental contact
-    restitution: 0.2,
+    contactRadius: 0.048,  // engagement distance — blades that look adjacent DO interact
+    pressOvershoot: 1.8,   // separation factor under an active press — the carry ratchet
+    idleOvershoot: 1.15,   // gentle ratchet for incidental contact
+    restitution: 0.35,     // lively taps — a beat leaves the other blade swinging
+    engagedSoften: 0.8,    // grip softens in light contact so blades ride each other
+    engageYield: 1.8,      // a resting engagement gives way when pushed — it is not a parry
     leverageEps: 0.06,     // even near-guard contact moves a blade slightly
     maxDeflect: 0.75,      // rad — hand grip limit on blade deflection
     gripK: 2400, gripD: 95,      // player grip spring (blade weight sim OFF — near 1:1)
@@ -86,6 +88,7 @@ const TRAINING_MODES = {
   stop: { label: 'Stop hit', time: 75, score: 8, objective: 'Hit during the opponent’s preparation or committed drive.' },
   hand: { label: 'Hand pick', time: 75, score: 10, objective: 'Control the point and score specifically on the weapon arm or hand.' },
   double: { label: 'No doubles', time: 90, score: 10, objective: 'Score cleanly. Every double touch counts against the drill.' },
+  target: { label: 'Target drill', time: 90, score: 999, objective: 'Hit the lit target point-first before it fades. Recover to guard between touches.' },
 };
 
 const OPPONENT_STYLES = {
@@ -264,6 +267,7 @@ class BladePhys {
     this.tipNow = new THREE.Vector3();
     this.yield = 1;    // contact-displacement multiplier (parry grip < 1)
     this.shock = 0;    // grip knocked loose by a hard beat (s remaining)
+    this.engagedT = 0; // in light blade contact right now (s remaining)
     this.init = false;
   }
 
@@ -271,7 +275,7 @@ class BladePhys {
     this.init = false;
     this.dirVel.set(0, 0, 0);
     this.flex = 0; this.flexVel = 0;
-    this.shock = 0;
+    this.shock = 0; this.engagedT = 0;
   }
 
   setTargets(rootWorld, dirWorld, frameDt) {
@@ -297,9 +301,12 @@ class BladePhys {
 
   substep(dt) {
     // grip spring toward the hand's intended direction (tangential error);
-    // a hard beat momentarily loosens the grip so displacement sticks
+    // a hard beat momentarily loosens the grip so displacement sticks,
+    // and light engagement softens it so blades visibly ride each other
     this.shock = Math.max(0, this.shock - dt);
-    const k = this.shock > 0 ? this.stiffness * 0.25 : this.stiffness;
+    this.engagedT = Math.max(0, this.engagedT - dt);
+    const k = this.shock > 0 ? this.stiffness * 0.25
+      : this.engagedT > 0 ? this.stiffness * PH.engagedSoften : this.stiffness;
     _b1.subVectors(this.targetDir, this.dir);
     _b1.addScaledVector(this.dir, -_b1.dot(this.dir));
     this.dirVel.addScaledVector(_b1, k * dt);
@@ -417,6 +424,10 @@ function bladeContact(A, B) {
   }
 
   if (_sp.dist >= PH.contactRadius) return null;
+
+  // both grips feel the engagement
+  A.engagedT = 0.08;
+  B.engagedT = 0.08;
 
   if (_sp.dist > 1e-6) _cn.subVectors(_sp.pA, _sp.pB).divideScalar(_sp.dist);
   else _cn.set(0, 1, 0);
@@ -856,6 +867,7 @@ function updateDrillHud() {
   let progress = `${match.scorePlayer} clean touches`;
   if (match.mode === 'distance') progress = `${Math.floor(session?.measureTime || 0)}s in measure`;
   if (match.mode === 'double') progress = `${match.scorePlayer} clean · ${session?.doubles || 0} doubles`;
+  if (match.mode === 'target') progress = `${drill.hits} hits · ${drill.misses} missed · streak ${drill.streak}`;
   document.getElementById('drillProgress').textContent = progress;
 }
 
@@ -893,6 +905,19 @@ function setLights({ opp = false, player = false, oppWhite = false, playerWhite 
 }
 
 function updateHud() {
+  if (match.mode === 'target' && match.started) {
+    hud.scoreL.textContent = drill.misses;
+    hud.scoreR.textContent = drill.hits;
+    hud.timer.textContent = drill.lastMs ? drill.lastMs + 'ms' : '—';
+    const avg = drill.reactions.length
+      ? Math.round(drill.reactions.reduce((a, b) => a + b, 0) / drill.reactions.length * 1000)
+      : 0;
+    hud.weaponTag.textContent = avg
+      ? `TARGET DRILL · avg ${avg}ms · streak ${drill.streak}`
+      : 'TARGET DRILL';
+    board.draw(drill.misses, drill.hits, match.time, 'DRILL', match.boardMsg);
+    return;
+  }
   hud.scoreL.textContent = match.scoreOpp;
   hud.scoreR.textContent = match.scorePlayer;
   const m = Math.floor(match.time / 60), s = Math.floor(match.time % 60);
@@ -920,6 +945,7 @@ const ai = {
   memory: { parryL: 0, parryR: 0, playerAdvances: 0 }, // reads of YOUR habits
   advCool: 0,
   guardBias: { x: 0, y: 0, tx: 0, ty: 0, t: 0 },       // slow line changes / invitations
+  engage: { side: 1, timer: 0, changing: 0 },          // blade-engagement seeking
   attacking: false,
   parryMsg: false,         // 'Parried!' shown for this parry
   beatMsg: false,          // 'Deflected!' shown for this attack
@@ -1003,11 +1029,13 @@ function updateOpponent(dt) {
 
   switch (ai.state) {
     case 'engarde': {
-      ai.extTarget = 0.16 + 0.09 * Math.sin(ai.bob * 0.8); // probing extensions
+      ai.extTarget = 0.26 + 0.08 * Math.sin(ai.bob * 0.8); // carried forward, seeking the blade
       ai.attacking = false;
+      if (match.mode === 'target') desired = 0.35 * Math.sin(ai.bob * 0.5); // slow drift — distance work
       if (dist > C.preferredDist + 0.25) aiSetState('advance');
       else if (dist < C.preferredDist - 0.35) aiSetState('retreat');
-      else if (match.phase === 'fencing' && Math.random() < C.attackChance * dt) choosePlan(dist);
+      else if (match.mode !== 'target' && match.phase === 'fencing' &&
+               Math.random() < C.attackChance * dt) choosePlan(dist);
       break;
     }
     case 'advance': {
@@ -1111,7 +1139,8 @@ function updateOpponent(dt) {
   }
 
   // attack on preparation: rushing into distance gets counterattacked (often to the arm)
-  if ((ai.state === 'engarde' || ai.state === 'advance') && match.phase === 'fencing' &&
+  if (match.mode !== 'target' &&
+      (ai.state === 'engarde' || ai.state === 'advance') && match.phase === 'fencing' &&
       closing > 1.3 && dist < 2.3 && dist > 1.4 && Math.random() < 2.5 * dt) {
     ai.plan = { type: 'counter', target: 'hand' };
     aiSetState('lunge');
@@ -1131,7 +1160,7 @@ function updateOpponent(dt) {
   // a slow creep doesn't read as an attack, a rushed advance draws the parry
   const committed = (ai.state === 'lunge' && ai.attacking) || ai.state === 'beat' ||
                     ai.state === 'riposte' || ai.state === 'parry' || ai.state === 'recover';
-  if (!committed && match.phase === 'fencing') {
+  if (!committed && match.phase === 'fencing' && match.mode !== 'target') {
     const tipToTorso = pBlade.tipNow.distanceTo(_t1.setFromMatrixPosition(opp.torso.matrixWorld));
     const approaching = pTipVel.z < -0.3;
     const bladeThreat = tipToTorso < 1.15 && approaching && pTipVel.length() > 1.8;
@@ -1198,10 +1227,45 @@ function updateOpponent(dt) {
   } else if (ai.state === 'beat') {
     target.copy(pBlade.root).addScaledVector(pBlade.dir, 0.55 * pBlade.len);
   } else {
-    const tName = ai.plan ? ai.plan.target : 'body';
+    const planAim = ai.plan && (ai.state === 'lunge' || ai.state === 'riposte');
+    const tName = planAim ? (ai.plan.target || 'body') : 'engage';
+    let wanderScale = 1;
     if (tName === 'hand') target.copy(playerVols[0].pos);
     else if (tName === 'mask') target.copy(playerVols[2].pos);
-    else target.set(playerTarget.center.x, playerTarget.center.y + 0.15, playerTarget.center.z);
+    else if (tName === 'engage' && match.mode === 'target') {
+      // drill dummy: hold a quiet low line out of the way — present the target
+      target.set(playerTarget.center.x + 0.45, 0.65, playerTarget.center.z);
+    }
+    else if (tName === 'engage') {
+      // default blade conversation: rest the point lightly against the
+      // player's blade, periodically changing engagement under the point;
+      // when the blade is absent, the point threatens the body instead
+      const eng = ai.engage;
+      const bladePresent =
+        Math.abs(pBlade.tipNow.x - playerTarget.center.x) < 0.55 &&
+        pBlade.tipNow.y > 0.6 && pBlade.tipNow.y < 1.8 &&
+        pBlade.tipNow.distanceTo(_t1.setFromMatrixPosition(opp.torso.matrixWorld)) < 2.4 &&
+        pTipVel.length() < 1.5; // a fast blade is an attack — stop resting, defend
+      if (bladePresent) {
+        wanderScale = 0.25;
+        eng.timer -= dt;
+        if (eng.timer <= 0) {
+          eng.timer = 1.2 + Math.random() * 1.6;
+          eng.side *= -1;
+          eng.changing = 0.18;
+        }
+        target.copy(pBlade.root).addScaledVector(pBlade.dir, 0.55 * pBlade.len);
+        target.x += eng.side * 0.035;
+        if (eng.changing > 0) {
+          eng.changing -= dt;
+          target.y -= 0.22; // change of engagement passes under the point
+        }
+      } else {
+        target.set(playerTarget.center.x, playerTarget.center.y + 0.15, playerTarget.center.z);
+      }
+    } else {
+      target.set(playerTarget.center.x, playerTarget.center.y + 0.15, playerTarget.center.z);
+    }
 
     // feint: show one line, then disengage UNDER the point into another —
     // blades can't pass through each other, so the route is around the tip
@@ -1217,8 +1281,8 @@ function updateOpponent(dt) {
     // living point: the tip is never still on guard
     if (!ai.attacking) {
       const t = ai.bob;
-      target.x += (Math.sin(t * 1.9) + 0.5 * Math.sin(t * 3.7 + 1.3)) * C.pointWander;
-      target.y += (Math.sin(t * 2.6 + 0.7) + 0.4 * Math.sin(t * 4.3)) * C.pointWander * 0.8;
+      target.x += (Math.sin(t * 1.9) + 0.5 * Math.sin(t * 3.7 + 1.3)) * C.pointWander * wanderScale;
+      target.y += (Math.sin(t * 2.6 + 0.7) + 0.4 * Math.sin(t * 4.3)) * C.pointWander * 0.8 * wanderScale;
     }
   }
 
@@ -1270,7 +1334,10 @@ function updateOpponent(dt) {
   oBlade.stiffness = (ai.state === 'parry' || ai.state === 'beat') ? PH.oppParryK
     : (ai.attacking ? PH.oppAttackK : PH.oppGuardK);
   oBlade.damping = 1.7 * Math.sqrt(oBlade.stiffness);
-  oBlade.yield = ai.state === 'parry' ? PH.parryYield : (ai.state === 'beat' ? 0.55 : 1);
+  oBlade.yield = ai.state === 'parry' ? PH.parryYield
+    : ai.state === 'beat' ? 0.55
+    : ai.attacking ? 1
+    : PH.engageYield; // resting blade gives way when pushed
 }
 
 /* ---------------- Blade physics step + contact feedback ---------------- */
@@ -1321,24 +1388,29 @@ function stepBladePhysics(dt) {
     ai.frozenAim.z -= strongest.nz * Math.min(0.3, strongest.impact * PH.beatAimShake);
   }
 
-  // --- contact feedback: sound + haptics scaled by impact, pitched by position ---
+  // --- contact feedback: you should FEEL the blade the whole time ---
   clashTimer -= dt; scrapeTimer -= dt;
   if (strongest) {
-    if (strongest.impact > 0.55 && clashTimer <= 0) {
+    if (strongest.impact > 0.3 && clashTimer <= 0) {
       clashTimer = 0.1;
-      const inten = Math.min(1, strongest.impact / 4);
+      const inten = Math.min(1, strongest.impact / 3.5);
       audio.clash(inten, strongest.sB);
-      pulseHaptic(0.25 + 0.7 * inten, 18 + inten * 35);
-      // hard beats visibly shiver the blades
+      pulseHaptic(0.2 + 0.75 * inten, 15 + inten * 40);
+      // beats visibly shiver the blades
       _t1.crossVectors(pBlade.dir, oBlade.dir);
       if (_t1.lengthSq() > 1e-6) {
         pBlade.kickFlex(strongest.impact * 0.25, _t1.normalize());
         oBlade.kickFlex(-strongest.impact * 0.25, _t1);
       }
-    } else if (strongest.slide > 0.35 && scrapeTimer <= 0) {
-      scrapeTimer = 0.08;
-      audio.scrape(Math.min(1, strongest.slide / 2.5));
-      pulseHaptic(0.15, 12);
+    } else if (strongest.slide > 0.12 && scrapeTimer <= 0) {
+      scrapeTimer = 0.09;
+      audio.scrape(Math.min(1, strongest.slide / 2));
+      pulseHaptic(0.12, 10);
+    } else if (scrapeTimer <= 0) {
+      // resting engagement: faint presence tick
+      scrapeTimer = 0.16;
+      audio.scrape(0.15);
+      pulseHaptic(0.06, 8);
     }
   }
 
@@ -1437,6 +1509,8 @@ function endBout() {
 
 function showSessionReport() {
   match.started = false; match.paused = false;
+  drill.active = false;
+  drillMesh.visible = false;
   document.exitPointerLock?.();
   document.getElementById('drillHud').style.display = 'none';
   const s = session || freshSession();
@@ -1452,7 +1526,9 @@ function showSessionReport() {
   const metrics = [
     [accuracy + '%', 'attack conversion'], [s.cleanHits, 'clean touches'], [s.doubles, 'double touches'],
     [s.parries, 'parries'], [parryRate + '%', 'riposte conversion'],
-    [match.mode === 'distance' ? Math.floor(s.measureTime) + 's' : cleanRate + '%', match.mode === 'distance' ? 'time in measure' : 'clean-hit rate'],
+    match.mode === 'target'
+      ? [drill.reactions.length ? Math.round(drill.reactions.reduce((a, b) => a + b, 0) / drill.reactions.length * 1000) + 'ms' : '—', 'avg reaction']
+      : [match.mode === 'distance' ? Math.floor(s.measureTime) + 's' : cleanRate + '%', match.mode === 'distance' ? 'time in measure' : 'clean-hit rate'],
   ];
   document.getElementById('reportGrid').innerHTML = metrics.map(([v,l]) => `<div class="metric"><b>${v}</b><span>${l}</span></div>`).join('');
   let advice = 'Build the next session around distance: arrive in measure with the point threatening, then leave after the action.';
@@ -1491,10 +1567,153 @@ function resetPhrase() {
   showMessage('En garde … Allez!', 1.0);
 }
 
+/* ---------------- Target drill: accuracy + reaction + technique ---------------- */
+
+const drill = {
+  active: false,
+  phase: 'return',      // return (recover to guard) → wait (random delay) → live
+  t: 0, delay: 0, window: 1.7,
+  spot: null,
+  targetPos: new THREE.Vector3(),
+  hits: 0, misses: 0, streak: 0,
+  reactions: [],
+  lastMs: 0,
+  flash: 0,
+};
+
+// weighted toward hand/forearm — épée bread and butter
+const DRILL_SPOTS = [
+  { name: 'hand', node: () => opp.hand, r: 0.055, w: 3 },
+  { name: 'forearm', node: () => opp.forearm, r: 0.06, w: 3 },
+  { name: 'upper arm', node: () => opp.upperArm, r: 0.06, w: 2 },
+  { name: 'chest', node: () => opp.torso, r: 0.07, w: 2 },
+  { name: 'mask', node: () => opp.head, r: 0.06, w: 1.5 },
+  { name: 'thigh', node: () => opp.legF.hip.children[0], r: 0.065, w: 1.5 },
+  { name: 'foot', node: () => opp.legF.knee.children[1], r: 0.055, w: 1 },
+];
+
+const drillMesh = new THREE.Mesh(
+  new THREE.SphereGeometry(1, 18, 14),
+  new THREE.MeshBasicMaterial({ color: 0xffd34d, transparent: true, opacity: 0.85 })
+);
+drillMesh.visible = false;
+scene.add(drillMesh);
+
+function drillPickSpot() {
+  let sum = 0;
+  for (const s of DRILL_SPOTS) sum += s.w;
+  let r = Math.random() * sum;
+  for (const s of DRILL_SPOTS) { r -= s.w; if (r <= 0) return s; }
+  return DRILL_SPOTS[0];
+}
+
+function drillResult(hit, msg) {
+  if (hit) {
+    drill.hits++; drill.streak++;
+    drill.lastMs = Math.round(drill.t * 1000);
+    drill.reactions.push(drill.t);
+    drill.flash = 0.25;
+    match.scorePlayer++;
+    if (session) {
+      session.attacks++; session.touchesFor++; session.cleanHits++;
+      if (drill.spot && (drill.spot.name === 'hand' || drill.spot.name === 'forearm')) session.handHits++;
+    }
+    audio.buzzer(1500, 0.1, 'sine', 0.2);
+    audio.buzzer(2000, 0.14, 'sine', 0.12);
+    showMessage(`${drill.lastMs} ms`, 0.9);
+    pulseHaptic(0.7, 60);
+  } else {
+    drill.misses++; drill.streak = 0;
+    match.scoreOpp++;
+    if (session) session.attacks++;
+    audio.buzzer(170, 0.25, 'square', 0.14);
+    showMessage(msg, 0.9);
+  }
+  drill.phase = 'return';
+  drill.t = 0;
+  drillMesh.visible = false;
+  updateHud();
+}
+
+function updateDrill(dt) {
+  if (!drill.active) return;
+  drill.flash = Math.max(0, drill.flash - dt);
+  drillMesh.material.color.set(drill.flash > 0 ? 0x35e065 : 0xffd34d);
+
+  playerTarget.update();
+  const tipOut = Math.abs(playerTarget.center.z - pBlade.tipNow.z);
+
+  switch (drill.phase) {
+    case 'return': { // no camping extended — recover to guard between reps
+      if (tipOut < 1.35) {
+        drill.t += dt;
+        if (drill.t > 0.2) {
+          drill.phase = 'wait';
+          drill.t = 0;
+          drill.delay = 0.6 + Math.random() * 1.8;
+        }
+      } else drill.t = 0;
+      break;
+    }
+    case 'wait': {
+      drill.t += dt;
+      if (drill.t >= drill.delay) {
+        drill.spot = drillPickSpot();
+        drill.window = Math.max(0.85, 1.7 - drill.streak * 0.06);
+        drill.phase = 'live';
+        drill.t = 0;
+        drillMesh.visible = true;
+        audio.buzzer(880, 0.09, 'sine', 0.18);
+      }
+      break;
+    }
+    case 'live': {
+      drill.t += dt;
+      if (drill.t > drill.window) drillResult(false, 'Too slow');
+      break;
+    }
+  }
+
+  if (drill.spot && drillMesh.visible) {
+    drill.spot.node().getWorldPosition(drill.targetPos);
+    drillMesh.position.copy(drill.targetPos);
+    drillMesh.scale.setScalar(drill.spot.r * (1 + 0.15 * Math.sin(drill.t * 12)));
+  }
+}
+
+// same force gates as a real touch — slaps and grazes don't count
+function drillCombat() {
+  if (!drill.active || drill.phase !== 'live') return;
+  const pSpeed = pTipVel.length();
+  if (pSpeed < 1e-3) return;
+  const axial = pTipVel.dot(pBlade.dir);
+  const alignment = axial / pSpeed;
+  if (axial < CONFIG.touch.axialSpeed || alignment < CONFIG.touch.alignment) return;
+
+  drill.spot.node().getWorldPosition(drill.targetPos);
+  if (pointSegmentDistance(drill.targetPos, pBlade.tipPrev, pBlade.tipNow) < drill.spot.r + 0.02) {
+    _t3.subVectors(drill.targetPos, pBlade.tipNow).normalize();
+    if (pBlade.dir.dot(_t3) >= CONFIG.touch.pointFirst - 0.1) {
+      drillResult(true);
+      return;
+    }
+  }
+  // a clean touch anywhere else = wrong spot
+  for (const part of opp.parts) {
+    const c = _t1.setFromMatrixPosition(part.node.matrixWorld);
+    if (pointSegmentDistance(c, pBlade.tipPrev, pBlade.tipNow) < part.radius) {
+      _t3.subVectors(c, pBlade.tipNow).normalize();
+      if (pBlade.dir.dot(_t3) >= CONFIG.touch.pointFirst) drillResult(false, 'Wrong spot');
+      return;
+    }
+  }
+}
+
 const _flexKick = new THREE.Vector3();
 
 function updateCombat(dt) {
   if (match.phase !== 'fencing' && match.phase !== 'lockout') return;
+  if (match.mode === 'target') { drillCombat(); return; }
 
   const W = WEAPONS[weaponKey];
 
@@ -1764,6 +1983,11 @@ function startSession() {
   match.scorePlayer = 0; match.scoreOpp = 0; match.time = mode.time;
   session = freshSession();
   ai.memory.parryL = 0; ai.memory.parryR = 0; ai.memory.playerAdvances = 0;
+  drill.active = match.mode === 'target';
+  drill.phase = 'return'; drill.t = 0;
+  drill.hits = 0; drill.misses = 0; drill.streak = 0;
+  drill.reactions = []; drill.lastMs = 0;
+  drillMesh.visible = false;
   updateHud(); updateDrillHud(); resetPhrase();
   coach(mode.objective, 3.4);
   if (!renderer.xr.isPresenting) renderer.domElement.requestPointerLock();
@@ -1786,7 +2010,7 @@ const clock = new THREE.Clock();
 updateHud();
 
 // Debug/test hook (harmless in production; lets automated tests drive the sim)
-window.SIM = { match, desktop, rig, opp, ai, CONFIG, WEAPONS, playerSword, pBlade, oBlade, applyInertiaSetting, aiSetState, choosePlan, playerVols };
+window.SIM = { match, desktop, rig, opp, ai, CONFIG, WEAPONS, playerSword, pBlade, oBlade, applyInertiaSetting, aiSetState, choosePlan, playerVols, drill, drillMesh };
 
 function step(dt) {
   window.__testTick?.(dt);
@@ -1815,6 +2039,7 @@ function step(dt) {
     updateOpponent(dt);
     stepBladePhysics(dt);
     updateCombat(dt);
+    if (match.mode === 'target') updateDrill(dt);
     updateDrillHud();
 
     if (Math.floor(match.time) !== Math.floor(match.time + dt)) updateHud();
